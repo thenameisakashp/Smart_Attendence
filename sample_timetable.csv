@@ -1,0 +1,5 @@
+day,subject_code,subject,start_time,end_time,section,room
+Monday,21CS43,Data Structures,09:00,10:00,CSE-A,Room 101
+Monday,21CS42,Operating Systems,10:00,11:00,CSE-A,Room 101
+Tuesday,21CS41,Algorithms,09:00,10:00,CSE-A,Room 102
+Friday,21CS43,Data Structures,14:00,15:00,CSE-B,Room 201

@@ -1,0 +1,38 @@
+[
+    {
+        "day": "Monday",
+        "subject_code": "21CS43",
+        "subject": "Data Structures",
+        "start_time": "09:00",
+        "end_time": "10:00",
+        "section": "CSE-A",
+        "room": "Room 101"
+    },
+    {
+        "day": "Monday",
+        "subject_code": "21CS42",
+        "subject": "Operating Systems",
+        "start_time": "10:00",
+        "end_time": "11:00",
+        "section": "CSE-A",
+        "room": "Room 101"
+    },
+    {
+        "day": "Tuesday",
+        "subject_code": "21CS41",
+        "subject": "Algorithms",
+        "start_time": "09:00",
+        "end_time": "10:00",
+        "section": "CSE-A",
+        "room": "Room 102"
+    },
+    {
+        "day": "Friday",
+        "subject_code": "21CS43",
+        "subject": "Data Structures",
+        "start_time": "14:00",
+        "end_time": "15:00",
+        "section": "CSE-B",
+        "room": "Room 201"
+    }
+]
