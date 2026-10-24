@@ -292,3 +292,45 @@ class-wise workflow started and finished without an error.
 This is an educational project under active development. Update this
 README whenever features are implemented, tested, or changed. Keep the
 code, database schema, and documentation aligned as the project evolves.
+
+# about dashboard
+# Smart Attendance Dashboard (Flask)
+
+This adds a local web dashboard while keeping your existing `attendance.py` unchanged.
+
+## Files
+- `app.py` — Flask routes, dashboard statistics, CSV export, and launch button
+- `templates/dashboard.html` — dashboard layout
+- `static/style.css` — responsive styling
+
+## Install
+Open a terminal in your existing Smart Attendance project folder and install Flask:
+
+```bash
+python -m pip install flask
+```
+
+Copy these files into the same folder as your existing `attendance.py`:
+- Copy `app.py` to the project root.
+- Copy the `templates` folder to the project root.
+- Copy the `static` folder to the project root.
+
+The expected existing data paths are:
+- `dataset/face_features.json`
+- `attendance_records/attendance_YYYY-MM-DD.csv`
+- `attendance.py`
+
+The dashboard reads student names and roll numbers from `face_features.json`, and attendance from the daily CSV file. It does not modify your face data or database.
+
+## Run
+```bash
+python app.py
+```
+Then open `http://127.0.0.1:5000` in your browser.
+
+## Notes
+- Use the date picker to view attendance for another day.
+- Search by name or roll number.
+- Export the selected day's records as CSV.
+- The "Start attendance" button launches the existing `attendance.py`.
+- This dashboard is intended for local use. Do not expose it to the public internet without adding authentication and production security.
