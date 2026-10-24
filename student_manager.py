@@ -52,8 +52,110 @@ def load_face_database():
 
 
 def save_face_database(data):
-    with open(FEATURES_FILE, "w", encoding="utf-8") as file:
-        json.dump(data, file, indent=4)
+    """Save face embeddings atomically to reduce the risk of JSON corruption."""
+    DATASET_DIR.mkdir(parents=True, exist_ok=True)
+    temporary_file = FEATURES_FILE.with_suffix(".json.tmp")
+
+    try:
+        with open(temporary_file, "w", encoding="utf-8") as file:
+            json.dump(data, file, indent=4, ensure_ascii=False)
+            file.flush()
+            import os
+            os.fsync(file.fileno())
+        temporary_file.replace(FEATURES_FILE)
+    finally:
+        if temporary_file.exists():
+            try:
+                temporary_file.unlink()
+            except OSError:
+                pass
+
+
+def _normalize_embedding(value):
+    """Return a finite, normalized 1-D embedding or None if invalid."""
+    try:
+        vector = np.asarray(value, dtype=np.float32).reshape(-1)
+    except (TypeError, ValueError):
+        return None
+    if vector.size == 0 or not np.all(np.isfinite(vector)):
+        return None
+    norm = float(np.linalg.norm(vector))
+    if norm < 1e-8:
+        return None
+    return vector / norm
+
+
+def find_similar_registered_face(new_embedding, face_database, threshold=0.363):
+    """Compare a new SFace embedding against JSON and SQLite records.
+
+    Returns (roll_number, name, similarity) for the strongest match when
+    similarity reaches threshold, otherwise None. Inactive students are
+    checked too, preventing re-registration under a different roll number.
+    """
+    new_vector = _normalize_embedding(new_embedding)
+    if new_vector is None:
+        raise RuntimeError("The captured face embedding is invalid.")
+
+    candidates = {}
+
+    # Read embeddings from JSON.
+    for roll_number, record in (face_database or {}).items():
+        if not isinstance(record, dict):
+            continue
+        vector = _normalize_embedding(record.get("feature"))
+        if vector is not None:
+            candidates[str(roll_number)] = {
+                "name": str(record.get("name", "Unknown")),
+                "feature": vector,
+            }
+
+    # Also read SQLite, in case the JSON and database are out of sync.
+    try:
+        with get_connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT roll_number, full_name, face_embedding
+                FROM students
+                """
+            ).fetchall()
+    except Exception as error:
+        raise RuntimeError(
+            f"Could not check existing student embeddings in SQLite: {error}"
+        ) from error
+
+    for row in rows:
+        roll_number = str(row["roll_number"])
+        raw_feature = row["face_embedding"]
+        try:
+            stored_feature = json.loads(raw_feature) if isinstance(raw_feature, str) else raw_feature
+        except (json.JSONDecodeError, TypeError):
+            continue
+        vector = _normalize_embedding(stored_feature)
+        if vector is not None:
+            candidates[roll_number] = {
+                "name": str(row["full_name"] or "Unknown"),
+                "feature": vector,
+            }
+
+    best_match = None
+    best_similarity = -1.0
+    for roll_number, record in candidates.items():
+        stored_vector = record["feature"]
+        if stored_vector.shape != new_vector.shape:
+            print(f"[DUPLICATE CHECK] Skipping {roll_number}: embedding dimensions do not match.")
+            continue
+        similarity = float(np.dot(new_vector, stored_vector))
+        print(f"[DUPLICATE CHECK] New face vs {roll_number}: {similarity:.4f}")
+        if similarity > best_similarity:
+            best_similarity = similarity
+            best_match = (roll_number, record["name"], similarity)
+
+    print(f"[DUPLICATE CHECK] Best similarity: {best_similarity:.4f}")
+    if best_match is not None and best_similarity >= threshold:
+        print("[DUPLICATE CHECK] POSSIBLE DUPLICATE DETECTED")
+        return best_match
+    print("[DUPLICATE CHECK] No duplicate above threshold.")
+    return None
 
 
 # ==================================================
@@ -141,11 +243,19 @@ def capture_face_embedding():
 
             _, faces = detector.detect(frame)
 
-            if faces is not None and len(faces) > 0:
-                face = max(
-                    faces,
-                    key=lambda item: item[2] * item[3],
-                )
+            if faces is not None and len(faces) == 1:
+                face = faces[0]
+
+                # Require a reasonably large face for a usable embedding.
+                if face[2] < 80 or face[3] < 80:
+                    text = "Move closer to the camera"
+                    color = (0, 165, 255)
+                    cv2.putText(frame, text, (20, 35), cv2.FONT_HERSHEY_SIMPLEX, 0.8, color, 2)
+                    cv2.putText(frame, "Press Q to cancel", (20, 70), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 255, 255), 2)
+                    cv2.imshow("Student Face Registration", frame)
+                    if cv2.waitKey(100) & 0xFF == ord("q"):
+                        break
+                    continue
 
                 aligned_face = recognizer.alignCrop(frame, face)
                 feature = recognizer.feature(aligned_face)
@@ -165,8 +275,12 @@ def capture_face_embedding():
                 color = (0, 255, 0)
 
             else:
-                text = "No face detected"
-                color = (0, 0, 255)
+                if faces is not None and len(faces) > 1:
+                    text = "Only one person should be in frame"
+                    color = (0, 0, 255)
+                else:
+                    text = "No face detected"
+                    color = (0, 0, 255)
 
             cv2.putText(
                 frame,
@@ -204,8 +318,10 @@ def capture_face_embedding():
         np.asarray(features, dtype=np.float32),
         axis=0,
     )
-
-    return average_feature.tolist()
+    normalized_feature = _normalize_embedding(average_feature)
+    if normalized_feature is None:
+        raise RuntimeError("Could not create a valid face embedding. Please try again.")
+    return normalized_feature.tolist()
 
 
 # ==================================================
@@ -644,6 +760,29 @@ class StudentManager:
                 self.status_label.config(text="Registration cancelled.")
                 return
 
+            # Detect duplicate faces BEFORE changing JSON or SQLite.
+            self.status_label.config(text="Checking existing face records...")
+            self.root.update_idletasks()
+            duplicate = find_similar_registered_face(
+                embedding,
+                face_database,
+                threshold=0.363,
+            )
+            if duplicate is not None:
+                duplicate_roll, duplicate_name, similarity = duplicate
+                messagebox.showerror(
+                    "Possible Duplicate Face",
+                    "This face resembles an existing student record.\n\n"
+                    f"Existing student: {duplicate_name}\n"
+                    f"Roll number: {duplicate_roll}\n"
+                    f"Cosine similarity: {similarity:.4f}\n\n"
+                    "Registration has been cancelled. Verify the record "
+                    "before trying again.",
+                    parent=self.root,
+                )
+                self.status_label.config(text=f"Possible duplicate detected: {duplicate_roll}")
+                return
+
             # Back up the existing JSON file before changing it.
             previous_json = (
                 FEATURES_FILE.read_text(encoding="utf-8")
@@ -868,4 +1007,3 @@ if __name__ == "__main__":
     root = tk.Tk()
     app = StudentManager(root)
     root.mainloop()
-
