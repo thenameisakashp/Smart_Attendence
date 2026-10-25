@@ -151,13 +151,9 @@ def get_categories():
 if __name__ == "__main__":
     initialize_database()
     seed_default_categories()
-
-print("\nDatabase initialized successfully!")
-print(f"Database location: {DATABASE_PATH}")
-
-print("\nAvailable education categories:")
-
-for category in get_categories():
-    print(f"- {category['name']}")
-
-print("\nYou can now proceed to the next development step.")
+    print("\nDatabase initialized successfully!")
+    print(f"Database location: {DATABASE_PATH}")
+    print("\nAvailable education categories:")
+    for category in get_categories():
+        print(f"- {category['name']}")
+    print("\nYou can now proceed to the next development step.")

@@ -1,336 +1,92 @@
-# Smart Attendance System
-
-A Python-based student attendance management project that uses face
-detection and face recognition to help record attendance. It is being
-developed for educational use, with class management, student
-registration, session-based attendance, and database-backed records.
-
-> **Project status:** Under active development. This README
-> distinguishes features represented by the current repository from
-> planned enhancements. Test features locally before treating them as
-> production-ready.
-
-## Contents
-
--   [Overview](#overview)
--   [Current Features](#current-features)
--   [Technology Stack](#technology-stack)
--   [Project Structure](#project-structure)
--   [Requirements](#requirements)
--   [Setup](#setup)
--   [Run the Application](#run-the-application)
--   [Data and Privacy](#data-and-privacy)
--   [Development Roadmap](#development-roadmap)
-
-## Overview
-
-The system is designed to support different education categories and
-class structures. It uses a webcam to detect faces, creates face
-embeddings for registered students, and records attendance for a
-selected class session.
-
-The current implementation uses OpenCV's YuNet face detector and SFace
-face recognizer. SQLite stores structured student, class, session, and
-attendance data. Some workflows also use JSON and CSV files.
-
-## Current Features
-
-The repository contains modules for: - Face detection and face
-recognition using YuNet and SFace. - Student registration with face
-samples/embeddings. - Student active/inactive management. - Dynamic
-education-category, course, academic-level, semester, and section
-management. - SQLite database initialization and storage. - Class-wise
-attendance sessions. - Session attendance records with a database
-uniqueness rule for one student per session. - Daily CSV attendance
-output from the standalone attendance workflow. - Timetable
-import/management utilities. - Tkinter-based management interfaces.
-
-## Technology Stack
-
--   **Language:** Python
--   **Computer vision:** OpenCV
--   **Face detection:** YuNet ONNX model
--   **Face recognition:** SFace ONNX model
--   **Database:** SQLite
--   **Data files:** JSON and CSV
--   **User interface:** Tkinter
--   **Development environment:** Windows / VS Code (other platforms may
-    require adjustments)
-
-## Project Structure
-
-``` text
-Smart_Attendence/
-├── attendance.py                 # Standalone/daily attendance workflow
-├── camera_test.py                # Camera test utility
-├── check_database.py             # Database inspection utility
-├── check_sessions.py             # Attendance-session inspection utility
-├── class_attendance.py           # Class-wise, session-based attendance
-├── class_manager.py              # Class/category/course/section management
-├── dashboard.py                  # Dashboard interface
-├── database.py                   # SQLite connection and schema setup
-├── debug_students.py             # Student/face-data debugging utility
-├── face_detection.py             # Face detection utility
-├── register_student.py           # Standalone student face registration
-├── student_manager.py            # Student registration and status management
-├── timetable_manager.py          # Timetable import/management
-├── sample_timetable.csv          # Example timetable input
-├── dataset/                      # Local database and face/timetable data
-├── models/
-│   ├── face_detection_yunet_2023mar.onnx
-│   └── face_recognition_sface_2021dec.onnx
-└── attendance_records/           # Generated daily attendance CSV files
-```
-
-Some data files and databases are generated at runtime and may not exist
-in a fresh clone.
-
-## Requirements
+# Smart Attendance System — Integrated Build
 
--   Python compatible with the installed OpenCV build.
--   A working webcam.
--   The two ONNX model files listed above.
--   Windows users can run the commands below in PowerShell.
--   Required packages include OpenCV and NumPy. Install any additional
-    packages imported by the script you plan to run.
-
-## Setup
-
-### 1. Clone the repository
-
-``` powershell
-git clone https://github.com/thenameisakashp/Smart_Attendence.git
-cd Smart_Attendence
-```
+This build keeps the original Python/Tkinter face-registration tool and OpenCV YuNet/SFace models, and connects them to a local Flask dashboard for departments, classes, class membership, subjects, lecturer access, timetable import, class attendance sessions, and reports.
 
-### 2. Create and activate a virtual environment
+## What is connected
 
-``` powershell
-python -m venv .venv
-.\.venv\Scripts\Activate.ps1
-```
+- HOD first-time setup and sign-in; passwords are hashed.
+- HOD-managed departments and classes.
+- Class-specific student membership. The dashboard opens the existing Tkinter Student Manager for face registration; it does not replace it with a web registration form.
+- Before the Tkinter Student Manager opens, web classes are synchronized into its legacy SQLite class selector so the selected class is identifiable there. After capturing a student's face, return to that class's Students page and assign the student to the class.
+- Subjects per class and lecturer account/subject assignments.
+- Lecturer access is restricted server-side to assigned classes and, when configured, assigned subjects.
+- CSV/XLSX timetable import with required-column, time, class matching, and overlap validation.
+- Scheduled attendance launch while the local Flask app is running. The scheduler checks every 15 seconds and catches up for timetable entries whose start time was within the last 30 minutes. It creates at most one session per timetable entry/date.
+- Class-scoped face recognition in `class_attendance_web.py`. It reads only the class's assigned student roster and the existing `dataset/face_features.json`; it writes records into SQLite and prevents duplicate attendance per student/session.
+- Class session reports derive absent/not-marked status from the class roster. The main dashboard can read both legacy daily CSV attendance and the new class/session records.
+- Audit entries for key account, assignment, subject, timetable, and attendance actions.
 
-### 3. Install core dependencies
+## Important limits
 
-``` powershell
-python -m pip install --upgrade pip
-python -m pip install opencv-contrib-python numpy
-```
+- The uploaded project did not include the YuNet/SFace ONNX model files. You must place both model files in `models/` before camera recognition/registration can run:
+  - `models/face_detection_yunet_2023mar.onnx`
+  - `models/face_recognition_sface_2021dec.onnx`
+- A working webcam is required. Automatic attendance opens a camera window on the computer running `app.py`; the browser itself cannot remotely access that computer's camera through this design.
+- The timetable scheduler runs only while the local `app.py` process is running. Keep the computer awake and the app open during class times. If the camera is busy, a model is missing, or the process cannot start, check the terminal and session status.
+- The 30-minute window is a scheduler catch-up grace period and the attendance window stays open until the scheduled end plus 30 minutes. The user can finish early with **Q** or **Esc** in the camera window.
+- Glasses/cap/accessory detection is **not implemented** by YuNet/SFace alone. Do not treat these models as an accessory classifier.
+- The previous standalone daily CSV attendance workflow remains available through `attendance.py`. It is a legacy workflow alongside the new class/session workflow, not the same session database.
+- The application is configured for local use at `127.0.0.1:5000`, not public internet deployment. Review security, consent, privacy, access controls, and institutional policies before using real student biometric data.
+- Absent status in class reports is currently derived from students assigned to the class who have no Present record for that session; it is not inserted as a separate `Absent` row.
 
-If a script reports another missing module, install it into the same
-virtual environment. Avoid installing conflicting OpenCV packages in one
-environment.
+## Setup on Windows
 
-### 4. Check model files
+1. Install a supported Python version and ensure the Tkinter component is installed.
+2. Open PowerShell in this project folder:
 
-Ensure these files exist:
+   ```powershell
+   python -m venv .venv
+   .\.venv\Scripts\Activate.ps1
+   python -m pip install --upgrade pip
+   python -m pip install -r requirements.txt
+   ```
 
-``` text
-models/face_detection_yunet_2023mar.onnx
-models/face_recognition_sface_2021dec.onnx
-```
+3. Copy the two ONNX model files into `models/` (see above).
+4. Start the dashboard:
 
-## Run the Application
+   ```powershell
+   python app.py
+   ```
 
-Run commands from the project root with the virtual environment
-activated.
+   Or double-click `start_dashboard.bat` after creating the environment and installing dependencies.
+5. Open `http://127.0.0.1:5000/setup` in your browser and create the HOD account. After setup, sign in at `http://127.0.0.1:5000/login`.
 
-### Initialize/check the database
+## Recommended first-time workflow
 
-``` powershell
-python database.py
-```
+1. **Departments & classes:** Create the department, then create a class such as `CSE-4-A`.
+2. **Students:** Open the class, select **Students**, and use **Register student / capture face**. The existing Tkinter Student Manager opens on the same computer. Choose the matching mirrored class in its class selector and complete registration.
+3. Return to the class Students page, refresh, and assign the registered student to the web class. Repeat for the roster.
+4. **Subjects:** Create subjects in the class workspace, or import a timetable that creates/updates subjects.
+5. **Lecturers:** Create lecturer accounts and assign them to a class, optionally restricting them to one subject. Revoke an assignment to remove access.
+6. **Timetable:** Import CSV/XLSX using these headers exactly (case-insensitive):
 
-### Open student management
+   `day,subject_code,subject,start_time,end_time,section,room`
 
-``` powershell
-python student_manager.py
-```
+   Example row: `Monday,21CS43,Data Structures,09:00,10:00,CSE-4-A,Room 101`
 
-### Open class management
+   The `section` value should match one class code (recommended) or an unambiguous section label. Overlaps for the same class/day are rejected.
+7. **Attendance:** Use the class's **Take attendance** page for a manual session, or leave `app.py` running for timetable-triggered sessions. The camera window shows recognition and present counts.
+8. **Reports:** Open the class attendance page and select a session report. Review all absences before treating them as official.
 
-``` powershell
-python class_manager.py
-```
+## Existing desktop tools retained
 
-### Run class-wise attendance
+- `student_manager.py` — primary Tkinter face registration/student status UI.
+- `class_manager.py` — legacy category/course/semester/section management UI.
+- `dashboard.py` — original Tkinter dashboard.
+- `attendance.py` — standalone daily CSV attendance.
+- `class_attendance.py` — original SQLite section-based attendance workflow.
+- `class_attendance_web.py` — class-specific attendance launched by the integrated web dashboard.
+- `database.py` — original desktop SQLite schema initializer.
+- `timetable_manager.py` — original local CSV/XLSX timetable JSON utility.
 
-``` powershell
-python class_attendance.py
-```
+## Data and backups
 
-Select the class/section, enter the subject, and start the attendance
-session. Finish the session using the application's stop/finish control.
+Runtime databases and biometric data are created under `dataset/`; daily CSVs are stored in `attendance_records/`. These files are intentionally excluded from source-control defaults. Back up local data securely. Do not upload real student face embeddings, biometric samples, populated databases, or attendance files to a public repository.
 
-### Run standalone attendance
+## Validation performed for this package
 
-``` powershell
-python attendance.py
-```
+- Python syntax compilation for the updated Flask app and new class attendance runner.
+- Jinja parsing for the HTML templates.
+- Template endpoint-name consistency check.
 
-### Inspect saved sessions
-
-``` powershell
-python check_sessions.py
-```
-
-### Test the camera
-
-``` powershell
-python camera_test.py
-```
-
-The standalone daily CSV workflow and class-wise SQLite session workflow
-are separate paths in the current project.
-
-## Data and Privacy
-
-This project processes biometric face embeddings and student attendance
-information. Treat these as sensitive data.
-
--   Do not commit real student face embeddings, biometric samples,
-    attendance records, or a populated local database to a public
-    repository.
--   Keep passwords, API keys, and other secrets out of source control.
--   Use synthetic/test records when demonstrating the project publicly.
--   Restrict access to folders containing student data.
--   Obtain appropriate consent and institutional approval before
-    collecting or processing students' biometric data.
--   Face recognition and accessory detection can make mistakes; provide
-    a manual review or correction process.
-
-Inspect repository contents before pushing. Add suitable local-data
-entries to `.gitignore` and remove sensitive files from tracking where
-necessary. Deleting a file in a later commit does not erase it from
-earlier Git history.
-
-## Development Roadmap
-
-The items below are **planned**, not claims that the functionality is
-already implemented.
-
-### Priority 1 --- Registration integrity and duplicate prevention
-
--   [ ] Compare a new face embedding with existing registered embeddings
-    before saving.
--   [ ] Check both active and inactive student records.
--   [ ] Flag likely duplicate faces across different roll numbers for
-    administrator review.
--   [ ] Validate similarity thresholds with test cases; a similarity
-    score is not proof of identity.
-
-### Priority 2 --- Strict appearance and face-quality checks
-
--   [ ] Evaluate a dedicated model for glasses, caps/hats, and face
-    coverings.
--   [ ] Apply checks during both registration and attendance.
--   [ ] Reject or request another capture when a prohibited accessory is
-    detected or detection is uncertain.
--   [ ] Require exactly one visible face and assess blur, face size, and
-    alignment.
--   [ ] Test false positives and false negatives before relying on the
-    checks.
-
-**Important:** YuNet and SFace do not, by themselves, guarantee reliable
-glasses/cap classification. A separate detector must be selected,
-integrated, and validated before this feature is considered complete.
-
-### Priority 3 --- Attendance completion rules
-
--   [ ] At session completion, mark eligible students without a present
-    record as absent.
--   [ ] Define how late arrivals and students who join after the session
-    starts are handled.
--   [ ] Keep records tied to the correct class, subject, date, and
-    session.
-
-### Priority 4 --- Reports and usability
-
--   [ ] Daily, weekly, monthly, class-wise, and student-wise reports.
--   [ ] Export session reports to CSV/Excel and PDF.
--   [ ] Improve error messages, logging, and camera failure handling.
--   [ ] Add tests for database operations and duplicate prevention.
-
-### Priority 5 --- Security and reliability
-
--   [ ] Add administrator authentication and role-based access where
-    required.
--   [ ] Add a manual review/correction workflow.
--   [ ] Add database backup and restore procedures.
--   [ ] Keep sensitive local data out of Git.
-
-## Troubleshooting
-
-### Camera does not open
-
--   Close other applications using the webcam.
--   Check camera permissions in Windows.
--   Run `python camera_test.py`.
--   Confirm the camera index in the script matches your webcam.
-
-### Model file not found
-
-Confirm that the ONNX files exist under `models/` and filenames match
-the paths in the code.
-
-### No students recognized
-
--   Confirm the student is active in SQLite.
--   Confirm the roll number exists in the face-feature JSON file.
--   Check lighting, camera distance, and face alignment.
--   Confirm the registration embedding was saved successfully.
-
-### Session does not appear in the database
-
-Run `python check_sessions.py` from the project root and verify that the
-class-wise workflow started and finished without an error.
-
-------------------------------------------------------------------------
-
-## Project Status
-
-This is an educational project under active development. Update this
-README whenever features are implemented, tested, or changed. Keep the
-code, database schema, and documentation aligned as the project evolves.
-
-# about dashboard
-# Smart Attendance Dashboard (Flask)
-
-This adds a local web dashboard while keeping your existing `attendance.py` unchanged.
-
-## Files
-- `app.py` — Flask routes, dashboard statistics, CSV export, and launch button
-- `templates/dashboard.html` — dashboard layout
-- `static/style.css` — responsive styling
-
-## Install
-Open a terminal in your existing Smart Attendance project folder and install Flask:
-
-```bash
-python -m pip install flask
-```
-
-Copy these files into the same folder as your existing `attendance.py`:
-- Copy `app.py` to the project root.
-- Copy the `templates` folder to the project root.
-- Copy the `static` folder to the project root.
-
-The expected existing data paths are:
-- `dataset/face_features.json`
-- `attendance_records/attendance_YYYY-MM-DD.csv`
-- `attendance.py`
-
-The dashboard reads student names and roll numbers from `face_features.json`, and attendance from the daily CSV file. It does not modify your face data or database.
-
-## Run
-```bash
-python app.py
-```
-Then open `http://127.0.0.1:5000` in your browser.
-
-## Notes
-- Use the date picker to view attendance for another day.
-- Search by name or roll number.
-- Export the selected day's records as CSV.
-- The "Start attendance" button launches the existing `attendance.py`.
-- This dashboard is intended for local use. Do not expose it to the public internet without adding authentication and production security.
+A live Flask/camera integration test could not be completed in this environment because Flask is not installed here and the ONNX model files/webcam were not supplied. Install the requirements and test on the target Windows computer before using the system for real attendance.

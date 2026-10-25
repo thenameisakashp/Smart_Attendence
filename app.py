@@ -2,6 +2,7 @@ from flask import Flask, render_template, request, Response, redirect, url_for, 
 from pathlib import Path
 from datetime import datetime, date, timedelta
 from functools import wraps
+from contextlib import contextmanager
 import csv, json, io, os, sqlite3, subprocess, sys, calendar, secrets
 from werkzeug.security import generate_password_hash, check_password_hash
 from collections import defaultdict
@@ -27,10 +28,20 @@ app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax")
 app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024
 
 
+@contextmanager
 def db():
-    conn = sqlite3.connect(DASHBOARD_DB)
+    """Open a short-lived SQLite connection and always close it after the transaction."""
+    conn = sqlite3.connect(DASHBOARD_DB, timeout=10)
     conn.row_factory = sqlite3.Row
-    return conn
+    conn.execute("PRAGMA foreign_keys = ON")
+    try:
+        yield conn
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
 
 
 def init_db():
@@ -45,6 +56,92 @@ def init_db():
             password_hash TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('hod','lecturer')),
             display_name TEXT NOT NULL, is_active INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL)""")
+        # Step 1: class records. Subjects, lecturer assignments, and timetable are later steps.
+        conn.execute("""CREATE TABLE IF NOT EXISTS classes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            class_code TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            department TEXT NOT NULL,
+            semester INTEGER NOT NULL CHECK(semester BETWEEN 1 AND 8),
+            section TEXT NOT NULL,
+            academic_year TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS departments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            code TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            name TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS class_students (
+            class_id INTEGER NOT NULL,
+            roll TEXT NOT NULL,
+            assigned_at TEXT NOT NULL,
+            PRIMARY KEY(class_id, roll),
+            FOREIGN KEY(class_id) REFERENCES classes(id) ON DELETE CASCADE)""")
+        # Operational class modules: subjects, timetable, lecturer assignments, and attendance.
+        conn.execute("""CREATE TABLE IF NOT EXISTS subjects (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, class_id INTEGER NOT NULL,
+            code TEXT NOT NULL, name TEXT NOT NULL, created_at TEXT NOT NULL,
+            UNIQUE(class_id, code), FOREIGN KEY(class_id) REFERENCES classes(id) ON DELETE CASCADE)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS lecturer_assignments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER NOT NULL, class_id INTEGER NOT NULL,
+            subject_id INTEGER, created_at TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE,
+            FOREIGN KEY(class_id) REFERENCES classes(id) ON DELETE CASCADE,
+            FOREIGN KEY(subject_id) REFERENCES subjects(id) ON DELETE CASCADE)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS timetable_entries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, class_id INTEGER NOT NULL, subject_id INTEGER NOT NULL,
+            day_of_week TEXT NOT NULL, start_time TEXT NOT NULL, end_time TEXT NOT NULL, room TEXT NOT NULL DEFAULT '',
+            is_active INTEGER NOT NULL DEFAULT 1, created_at TEXT NOT NULL,
+            UNIQUE(class_id, day_of_week, start_time, subject_id),
+            FOREIGN KEY(class_id) REFERENCES classes(id) ON DELETE CASCADE,
+            FOREIGN KEY(subject_id) REFERENCES subjects(id) ON DELETE CASCADE)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS attendance_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, class_id INTEGER NOT NULL, subject_id INTEGER NOT NULL,
+            session_date TEXT NOT NULL, start_time TEXT NOT NULL, end_time TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'scheduled', source_timetable_id INTEGER,
+            started_at TEXT, completed_at TEXT, process_id INTEGER, launch_attempts INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            UNIQUE(source_timetable_id, session_date),
+            FOREIGN KEY(class_id) REFERENCES classes(id) ON DELETE CASCADE,
+            FOREIGN KEY(subject_id) REFERENCES subjects(id) ON DELETE RESTRICT,
+            FOREIGN KEY(source_timetable_id) REFERENCES timetable_entries(id) ON DELETE SET NULL)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS attendance_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, session_id INTEGER NOT NULL, roll TEXT NOT NULL,
+            student_name TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'Present', marked_at TEXT NOT NULL,
+            UNIQUE(session_id, roll), FOREIGN KEY(session_id) REFERENCES attendance_sessions(id) ON DELETE CASCADE)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS audit_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, actor_user_id INTEGER, action TEXT NOT NULL,
+            target_type TEXT NOT NULL DEFAULT '', target_id TEXT NOT NULL DEFAULT '', details TEXT NOT NULL DEFAULT '',
+            created_at TEXT NOT NULL, FOREIGN KEY(actor_user_id) REFERENCES users(id) ON DELETE SET NULL)""")
+        session_columns = {row[1] for row in conn.execute("PRAGMA table_info(attendance_sessions)")}
+        if "process_id" not in session_columns:
+            conn.execute("ALTER TABLE attendance_sessions ADD COLUMN process_id INTEGER")
+        if "launch_attempts" not in session_columns:
+            conn.execute("ALTER TABLE attendance_sessions ADD COLUMN launch_attempts INTEGER NOT NULL DEFAULT 0")
+        # Seed common engineering departments once; the HOD can add others.
+        department_count = conn.execute("SELECT COUNT(*) FROM departments").fetchone()[0]
+        if department_count == 0:
+            now = datetime.now().isoformat(timespec="seconds")
+            defaults = [
+                ("CSE", "Computer Science and Engineering", ""),
+                ("CIVIL", "Civil Engineering", ""),
+                ("AIML", "Artificial Intelligence and Machine Learning", ""),
+                ("MECH", "Mechanical Engineering", ""),
+                ("ECE", "Electronics and Communication Engineering", ""),
+                ("EEE", "Electrical and Electronics Engineering", ""),
+                ("ISE", "Information Science and Engineering", ""),
+                ("OTHER", "Other Department", "Add a department not listed here"),
+            ]
+            conn.executemany("INSERT INTO departments(code,name,description,created_at) VALUES(?,?,?,?)",
+                             [(code, name, desc, now) for code, name, desc in defaults])
+        # Preserve any departments already present in classes created before this update.
+        for row in conn.execute("SELECT DISTINCT department FROM classes"):
+            code = (row[0] or "").strip().upper()
+            if code and not conn.execute("SELECT 1 FROM departments WHERE code=?", (code,)).fetchone():
+                now = datetime.now().isoformat(timespec="seconds")
+                conn.execute("INSERT INTO departments(code,name,description,created_at) VALUES(?,?,?,?)",
+                             (code, code, "Migrated from an existing class", now))
 
 
 def login_required(fn):
@@ -72,6 +169,45 @@ def role_required(*roles):
             return fn(*args, **kwargs)
         return wrapped
     return decorator
+
+
+def audit(action, target_type="", target_id="", details=""):
+    """Write a small audit event without allowing logging failures to break a request or scheduler thread."""
+    try:
+        try:
+            actor_id = session.get("user_id")
+        except RuntimeError:  # background scheduler has no Flask request context
+            actor_id = None
+        with db() as conn:
+            conn.execute(
+                "INSERT INTO audit_logs(actor_user_id,action,target_type,target_id,details,created_at) VALUES(?,?,?,?,?,?)",
+                (actor_id, action, target_type, str(target_id), details[:1000], datetime.now().isoformat(timespec="seconds")),
+            )
+    except Exception:
+        pass
+
+
+def class_access_allowed(class_id):
+    if session.get("role") == "hod":
+        return True
+    if session.get("role") != "lecturer":
+        return False
+    with db() as conn:
+        return bool(conn.execute(
+            "SELECT 1 FROM lecturer_assignments WHERE user_id=? AND class_id=? LIMIT 1",
+            (session.get("user_id"), class_id),
+        ).fetchone())
+
+
+def class_access_required(fn):
+    @wraps(fn)
+    @login_required
+    def wrapped(*args, **kwargs):
+        class_id = kwargs.get("class_id")
+        if class_id is None or not class_access_allowed(class_id):
+            return render_template("forbidden.html"), 403
+        return fn(*args, **kwargs)
+    return wrapped
 
 
 def load_students():
@@ -112,23 +248,34 @@ def attendance_file(day_text):
 
 
 def load_attendance(day_text):
+    """Merge legacy daily CSV rows with class/session attendance stored in SQLite."""
     records = {}
     path = attendance_file(day_text)
-    if not path.exists():
-        return records
+    if path.exists():
+        try:
+            with path.open("r", newline="", encoding="utf-8-sig") as f:
+                for row in csv.DictReader(f):
+                    roll = (row.get("Roll Number") or row.get("roll_number") or row.get("Roll") or row.get("roll") or "").strip()
+                    if not roll:
+                        continue
+                    records[roll] = {
+                        "roll": roll,
+                        "name": (row.get("Name") or row.get("Student Name") or row.get("full_name") or "").strip(),
+                        "time": (row.get("Time") or row.get("Timestamp") or row.get("time") or "").strip(),
+                        "status": (row.get("Status") or row.get("status") or "Present").strip() or "Present",
+                    }
+        except OSError:
+            pass
     try:
-        with path.open("r", newline="", encoding="utf-8-sig") as f:
-            for row in csv.DictReader(f):
-                roll = (row.get("Roll Number") or row.get("roll_number") or row.get("Roll") or row.get("roll") or "").strip()
-                if not roll:
-                    continue
-                records[roll] = {
-                    "roll": roll,
-                    "name": (row.get("Name") or row.get("Student Name") or row.get("full_name") or "").strip(),
-                    "time": (row.get("Time") or row.get("Timestamp") or row.get("time") or "").strip(),
-                    "status": (row.get("Status") or row.get("status") or "Present").strip() or "Present",
-                }
-    except OSError:
+        with db() as conn:
+            rows = conn.execute("""SELECT r.roll,r.student_name,r.status,r.marked_at
+                FROM attendance_records r JOIN attendance_sessions a ON a.id=r.session_id
+                WHERE a.session_date=? ORDER BY r.marked_at""", (day_text,)).fetchall()
+        for row in rows:
+            records[row["roll"]] = {"roll": row["roll"], "name": row["student_name"],
+                                    "time": row["marked_at"], "status": row["status"]}
+    except sqlite3.Error:
+        # Keep the dashboard usable if opened against an older database before migrations run.
         pass
     return records
 
@@ -142,6 +289,11 @@ def all_days():
             days.append(day_text)
         except ValueError:
             continue
+    try:
+        with db() as conn:
+            days.extend(row[0] for row in conn.execute("SELECT DISTINCT session_date FROM attendance_sessions"))
+    except sqlite3.Error:
+        pass
     return sorted(set(days))
 
 
@@ -254,11 +406,69 @@ def logout():
 @app.route("/lecturer")
 @role_required("lecturer")
 def lecturer_dashboard():
-    return render_template("lecturer_dashboard.html", display_name=session.get("display_name", "Lecturer"), username=session.get("username", ""))
+    with db() as conn:
+        assignments = conn.execute("""SELECT c.id AS class_id,c.class_code,c.department,c.semester,c.section,c.academic_year,
+            s.name AS subject_name,s.code AS subject_code
+            FROM lecturer_assignments la JOIN classes c ON c.id=la.class_id
+            LEFT JOIN subjects s ON s.id=la.subject_id WHERE la.user_id=?
+            ORDER BY c.department,c.semester,c.section,s.name""", (session["user_id"],)).fetchall()
+    return render_template("lecturer_dashboard.html", display_name=session.get("display_name", "Lecturer"),
+                           username=session.get("username", ""), assignments=assignments)
+
+
+def sync_web_classes_to_desktop_db():
+    """Mirror web classes into the legacy Tkinter class tables so registration can choose the matching class."""
+    import contextlib
+    import io as _io
+    with contextlib.redirect_stdout(_io.StringIO()):
+        import database as desktop_database
+        desktop_database.initialize_database()
+        desktop_database.seed_default_categories()
+    with db() as web_conn:
+        web_classes = web_conn.execute("SELECT id,class_code,department,semester,section,academic_year FROM classes ORDER BY id").fetchall()
+    with desktop_database.get_connection() as conn:
+        conn.execute("""CREATE TABLE IF NOT EXISTS web_class_sync (
+            web_class_id INTEGER PRIMARY KEY, section_id INTEGER NOT NULL UNIQUE,
+            FOREIGN KEY(section_id) REFERENCES sections(id))""")
+        category = conn.execute("SELECT id FROM education_categories WHERE name='Engineering'").fetchone()
+        if category is None:
+            category_id = conn.execute("INSERT INTO education_categories(name) VALUES('Engineering')").lastrowid
+        else:
+            category_id = category["id"]
+        for cls in web_classes:
+            course = conn.execute("SELECT id FROM courses WHERE category_id=? AND name=?", (category_id, cls["department"])).fetchone()
+            if course is None:
+                course_id = conn.execute("INSERT INTO courses(category_id,name) VALUES(?,?)", (category_id, cls["department"])).lastrowid
+            else:
+                course_id = course["id"]
+            level_name = f"B.E. {cls['department']}"
+            level = conn.execute("SELECT id FROM academic_levels WHERE course_id=? AND name=?", (course_id, level_name)).fetchone()
+            if level is None:
+                level_id = conn.execute("INSERT INTO academic_levels(course_id,name,level_order) VALUES(?,?,1)", (course_id, level_name)).lastrowid
+            else:
+                level_id = level["id"]
+            semester_name = f"Semester {cls['semester']}"
+            semester = conn.execute("SELECT id FROM semesters WHERE academic_level_id=? AND semester_order=?", (level_id, cls["semester"])).fetchone()
+            if semester is None:
+                semester_id = conn.execute("INSERT INTO semesters(academic_level_id,name,semester_order) VALUES(?,?,?)", (level_id, semester_name, cls["semester"])).lastrowid
+            else:
+                semester_id = semester["id"]
+                conn.execute("UPDATE semesters SET name=? WHERE id=?", (semester_name, semester_id))
+            mapping = conn.execute("SELECT section_id FROM web_class_sync WHERE web_class_id=?", (cls["id"],)).fetchone()
+            if mapping:
+                section_id = mapping["section_id"]
+                conn.execute("UPDATE sections SET academic_level_id=?,semester_id=?,name=? WHERE id=?", (level_id, semester_id, cls["class_code"], section_id))
+            else:
+                existing = conn.execute("SELECT id FROM sections WHERE academic_level_id=? AND semester_id=? AND name=?", (level_id, semester_id, cls["class_code"])).fetchone()
+                if existing:
+                    section_id = existing["id"]
+                else:
+                    section_id = conn.execute("INSERT INTO sections(academic_level_id,semester_id,name) VALUES(?,?,?)", (level_id, semester_id, cls["class_code"])).lastrowid
+                conn.execute("INSERT OR REPLACE INTO web_class_sync(web_class_id,section_id) VALUES(?,?)", (cls["id"], section_id))
 
 
 @app.post("/launch-student-manager")
-@role_required("hod", "lecturer")
+@role_required("hod")
 def launch_student_manager():
     """Launch the existing desktop face-registration UI on the machine running Flask."""
     script = BASE_DIR / "student_manager.py"
@@ -266,13 +476,18 @@ def launch_student_manager():
         flash("student_manager.py was not found. Put it in the same project folder as app.py.", "error")
     else:
         try:
+            sync_web_classes_to_desktop_db()
             subprocess.Popen([sys.executable, str(script)], cwd=str(BASE_DIR))
-            flash("Student Manager opened on the computer running this dashboard. Complete face capture in its window.", "success")
-        except OSError as exc:
-            flash(f"Could not open student_manager.py: {exc}", "error")
+            flash("Student Manager opened. Web classes were synced into its class selector; register/capture the face, then assign the student to the class here.", "success")
+        except Exception as exc:
+            flash(f"Could not open student_manager.py or sync class data: {exc}", "error")
+    next_path = request.form.get("next", "").strip()
+    # Only accept local app paths; never redirect to an external URL.
+    if next_path.startswith("/") and not next_path.startswith("//"):
+        return redirect(next_path)
     if session.get("role") == "lecturer":
         return redirect(url_for("lecturer_dashboard"))
-    return redirect(url_for("index"))
+    return redirect(url_for("students_page"))
 
 
 @app.route("/")
@@ -315,6 +530,219 @@ def analytics_api():
         month_labels.append(label)
         month_values.append(monthly_present)
     return jsonify({"daily": days, "monthly_labels": month_labels, "monthly_present": month_values})
+
+
+@app.route("/departments", methods=["GET", "POST"])
+@role_required("hod")
+def department_management():
+    if request.method == "POST":
+        code = request.form.get("code", "").strip().upper()
+        name = request.form.get("name", "").strip()
+        description = request.form.get("description", "").strip()
+        if not code or not name:
+            flash("Enter both a department code and name.", "error")
+        elif len(code) > 20 or len(name) > 120 or len(description) > 240:
+            flash("A department field is too long.", "error")
+        else:
+            try:
+                with db() as conn:
+                    conn.execute("INSERT INTO departments(code,name,description,created_at) VALUES(?,?,?,?)",
+                                 (code, name, description, datetime.now().isoformat(timespec="seconds")))
+                flash(f"Department {code} created.", "success")
+                return redirect(url_for("department_management"))
+            except sqlite3.IntegrityError:
+                flash("That department code already exists.", "error")
+    with db() as conn:
+        departments = conn.execute("""SELECT d.*,
+            (SELECT COUNT(*) FROM classes c WHERE upper(c.department)=upper(d.code) OR upper(c.department)=upper(d.name)) AS class_count
+            FROM departments d ORDER BY d.name COLLATE NOCASE""").fetchall()
+    return render_template("departments.html", departments=departments,
+                           admin_user=session.get("username", "hod"))
+
+
+@app.post("/departments/<int:department_id>/edit")
+@role_required("hod")
+def edit_department(department_id):
+    code = request.form.get("code", "").strip().upper()
+    name = request.form.get("name", "").strip()
+    description = request.form.get("description", "").strip()
+    if not code or not name or len(code) > 20 or len(name) > 120 or len(description) > 240:
+        flash("Enter valid department details (code/name required).", "error")
+    else:
+        try:
+            with db() as conn:
+                old = conn.execute("SELECT code FROM departments WHERE id=?", (department_id,)).fetchone()
+                if not old:
+                    flash("Department not found.", "error")
+                else:
+                    old_code = old["code"]
+                    conn.execute("UPDATE departments SET code=?, name=?, description=? WHERE id=?",
+                                 (code, name, description, department_id))
+                    if old_code.casefold() != code.casefold():
+                        conn.execute("UPDATE classes SET department=?, updated_at=? WHERE upper(department)=upper(?)",
+                                     (code, datetime.now().isoformat(timespec="seconds"), old_code))
+                    flash("Department updated.", "success")
+        except sqlite3.IntegrityError:
+            flash("That department code is already in use.", "error")
+    return redirect(url_for("department_management"))
+
+
+@app.post("/departments/<int:department_id>/delete")
+@role_required("hod")
+def delete_department(department_id):
+    with db() as conn:
+        department = conn.execute("SELECT * FROM departments WHERE id=?", (department_id,)).fetchone()
+        if not department:
+            flash("Department not found.", "error")
+        else:
+            count = conn.execute("SELECT COUNT(*) FROM classes WHERE upper(department)=upper(?) OR upper(department)=upper(?)",
+                                 (department["code"], department["name"])).fetchone()[0]
+            if count:
+                flash("This department still has classes. Move or delete its classes before deleting the department.", "error")
+            else:
+                conn.execute("DELETE FROM departments WHERE id=?", (department_id,))
+                flash("Department deleted.", "success")
+    return redirect(url_for("department_management"))
+
+
+@app.route("/departments/<int:department_id>/classes", methods=["GET", "POST"])
+@role_required("hod")
+def class_management(department_id):
+    with db() as conn:
+        department = conn.execute("SELECT * FROM departments WHERE id=?", (department_id,)).fetchone()
+    if not department:
+        flash("Department not found.", "error")
+        return redirect(url_for("department_management"))
+    if request.method == "POST":
+        class_code = request.form.get("class_code", "").strip().upper()
+        section = request.form.get("section", "").strip().upper()
+        academic_year = request.form.get("academic_year", "").strip()
+        semester_text = request.form.get("semester", "").strip()
+        if not all([class_code, section, academic_year, semester_text]):
+            flash("Complete all class fields before saving.", "error")
+        elif any(len(value) > limit for value, limit in [(class_code, 40), (section, 20), (academic_year, 20)]):
+            flash("One or more class fields are too long.", "error")
+        else:
+            try:
+                semester = int(semester_text)
+                if semester < 1 or semester > 8:
+                    raise ValueError
+                now = datetime.now().isoformat(timespec="seconds")
+                with db() as conn:
+                    conn.execute("INSERT INTO classes(class_code, department, semester, section, academic_year, created_at, updated_at) VALUES(?,?,?,?,?,?,?)",
+                                 (class_code, department["code"], semester, section, academic_year, now, now))
+                flash(f"Class {class_code} created in {department['name']}.", "success")
+                return redirect(url_for("class_management", department_id=department_id))
+            except ValueError:
+                flash("Semester must be a number from 1 to 8.", "error")
+            except sqlite3.IntegrityError:
+                flash("That class code already exists. Use a unique class code.", "error")
+    with db() as conn:
+        classes = conn.execute("SELECT * FROM classes WHERE upper(department)=upper(?) OR upper(department)=upper(?) ORDER BY semester, section, academic_year, class_code",
+                               (department["code"], department["name"])).fetchall()
+    return render_template("class_management.html", classes=classes, department=department,
+                           admin_user=session.get("username", "hod"))
+
+
+@app.get("/classes/<int:class_id>")
+@class_access_required
+def class_dashboard(class_id):
+    with db() as conn:
+        class_record = conn.execute("SELECT * FROM classes WHERE id=?", (class_id,)).fetchone()
+        if not class_record:
+            flash("Class not found.", "error")
+            return redirect(url_for("department_management"))
+        department = conn.execute("SELECT * FROM departments WHERE upper(code)=upper(?) OR upper(name)=upper(?) LIMIT 1",
+                                  (class_record["department"], class_record["department"])).fetchone()
+        student_count = conn.execute("SELECT COUNT(*) FROM class_students WHERE class_id=?", (class_id,)).fetchone()[0]
+        assigned_rolls = [r[0] for r in conn.execute("SELECT roll FROM class_students WHERE class_id=?", (class_id,))]
+    return render_template("class_dashboard.html", class_record=class_record, department=department,
+                           student_count=student_count, admin_user=session.get("username", "hod"),
+                           user_role=session.get("role", "hod"))
+
+
+@app.route("/classes/<int:class_id>/students", methods=["GET", "POST"])
+@class_access_required
+def class_students(class_id):
+    if request.method == "POST" and session.get("role") != "hod":
+        return render_template("forbidden.html"), 403
+    all_students = load_students()
+    with db() as conn:
+        class_record = conn.execute("SELECT * FROM classes WHERE id=?", (class_id,)).fetchone()
+        if not class_record:
+            flash("Class not found.", "error")
+            return redirect(url_for("department_management"))
+        if request.method == "POST":
+            roll = request.form.get("roll", "").strip()
+            if roll not in all_students:
+                flash("Choose a student who exists in the student manager records.", "error")
+            else:
+                try:
+                    conn.execute("INSERT INTO class_students(class_id, roll, assigned_at) VALUES(?,?,?)",
+                                 (class_id, roll, datetime.now().isoformat(timespec="seconds")))
+                    flash(f"{all_students[roll]['name']} assigned to {class_record['class_code']}.", "success")
+                except sqlite3.IntegrityError:
+                    flash("That student is already assigned to this class.", "error")
+            return redirect(url_for("class_students", class_id=class_id))
+        rows = conn.execute("SELECT roll, assigned_at FROM class_students WHERE class_id=? ORDER BY roll", (class_id,)).fetchall()
+    assigned = []
+    for row in rows:
+        student = all_students.get(row["roll"], {"roll": row["roll"], "name": "Student record not found", "enrolled": False})
+        assigned.append({**student, "assigned_at": row["assigned_at"]})
+    unassigned = [student for roll, student in sorted(all_students.items(), key=lambda item: (item[1]["name"].casefold(), item[0]))
+                  if not any(s["roll"] == roll for s in assigned)]
+    return render_template("class_students.html", class_record=class_record, students=assigned,
+                           unassigned=unassigned, admin_user=session.get("username", "hod"),
+                           user_role=session.get("role", "hod"))
+
+
+@app.post("/classes/<int:class_id>/students/<path:roll>/remove")
+@role_required("hod")
+def remove_class_student(class_id, roll):
+    with db() as conn:
+        conn.execute("DELETE FROM class_students WHERE class_id=? AND roll=?", (class_id, roll))
+    flash("Student removed from this class. Their face record has not been deleted.", "success")
+    return redirect(url_for("class_students", class_id=class_id))
+
+
+@app.post("/classes/<int:class_id>/edit")
+@role_required("hod")
+def edit_class(class_id):
+    class_code = request.form.get("class_code", "").strip().upper()
+    department = request.form.get("department", "").strip().upper()
+    section = request.form.get("section", "").strip().upper()
+    academic_year = request.form.get("academic_year", "").strip()
+    semester_text = request.form.get("semester", "").strip()
+    if not all([class_code, department, section, academic_year, semester_text]):
+        flash("Complete all class fields before saving.", "error")
+    elif any(len(value) > limit for value, limit in [(class_code, 40), (department, 80), (section, 20), (academic_year, 20)]):
+        flash("One or more class fields are too long.", "error")
+    else:
+        try:
+            semester = int(semester_text)
+            if semester < 1 or semester > 8:
+                raise ValueError
+            with db() as conn:
+                result = conn.execute("UPDATE classes SET class_code=?, department=?, semester=?, section=?, academic_year=?, updated_at=? WHERE id=?",
+                                      (class_code, department, semester, section, academic_year, datetime.now().isoformat(timespec="seconds"), class_id))
+                if result.rowcount:
+                    flash(f"Class {class_code} updated.", "success")
+                else:
+                    flash("Class not found.", "error")
+        except ValueError:
+            flash("Semester must be a number from 1 to 8.", "error")
+        except sqlite3.IntegrityError:
+            flash("That class code is already in use by another class.", "error")
+    return redirect(url_for("department_management"))
+
+
+@app.post("/classes/<int:class_id>/delete")
+@role_required("hod")
+def delete_class(class_id):
+    with db() as conn:
+        result = conn.execute("DELETE FROM classes WHERE id=?", (class_id,))
+    flash("Class deleted." if result.rowcount else "Class not found.", "success" if result.rowcount else "error")
+    return redirect(url_for("department_management"))
 
 
 @app.get("/students")
@@ -494,6 +922,403 @@ def start_attendance():
     return redirect(url_for("index", date=request.form.get("date", date.today().isoformat())))
 
 
+@app.route("/lecturers", methods=["GET", "POST"])
+@role_required("hod")
+def lecturers_page():
+    if request.method == "POST":
+        action = request.form.get("action", "create")
+        now = datetime.now().isoformat(timespec="seconds")
+        if action == "create":
+            username = request.form.get("username", "").strip()
+            display_name = request.form.get("display_name", "").strip()
+            password = request.form.get("password", "")
+            if not username or not display_name or len(username) > 80 or len(display_name) > 120 or len(password) < 12:
+                flash("Enter a username/name and a password of at least 12 characters.", "error")
+            else:
+                try:
+                    with db() as conn:
+                        conn.execute("INSERT INTO users(username,password_hash,role,display_name,created_at) VALUES(?,?,?,?,?)",
+                                     (username, generate_password_hash(password), "lecturer", display_name, now))
+                    audit("lecturer_created", "user", username, display_name)
+                    flash(f"Lecturer account '{username}' created.", "success")
+                except sqlite3.IntegrityError:
+                    flash("That username already exists.", "error")
+        elif action == "assign":
+            try:
+                user_id = int(request.form.get("user_id", ""))
+                class_id = int(request.form.get("class_id", ""))
+                subject_text = request.form.get("subject_id", "").strip()
+                subject_id = int(subject_text) if subject_text else None
+                with db() as conn:
+                    user = conn.execute("SELECT id,role FROM users WHERE id=?", (user_id,)).fetchone()
+                    class_row = conn.execute("SELECT id FROM classes WHERE id=?", (class_id,)).fetchone()
+                    subject = conn.execute("SELECT id,class_id FROM subjects WHERE id=?", (subject_id,)).fetchone() if subject_id else None
+                    if not user or user["role"] != "lecturer" or not class_row:
+                        raise ValueError("Choose a valid lecturer and class.")
+                    if subject_id and (not subject or subject["class_id"] != class_id):
+                        raise ValueError("The selected subject does not belong to that class.")
+                    exists = conn.execute("SELECT id FROM lecturer_assignments WHERE user_id=? AND class_id=? AND COALESCE(subject_id,0)=COALESCE(?,0)",
+                                           (user_id, class_id, subject_id)).fetchone()
+                    if not exists:
+                        conn.execute("INSERT INTO lecturer_assignments(user_id,class_id,subject_id,created_at) VALUES(?,?,?,?)",
+                                     (user_id, class_id, subject_id, now))
+                audit("lecturer_assigned", "class", class_id, f"user={user_id}; subject={subject_id}")
+                flash("Lecturer assignment saved.", "success")
+            except (ValueError, TypeError) as exc:
+                flash(str(exc) or "Choose a valid assignment.", "error")
+            except sqlite3.IntegrityError:
+                flash("Could not save that assignment.", "error")
+        return redirect(url_for("lecturers_page"))
+    with db() as conn:
+        lecturers = conn.execute("SELECT id,username,display_name,is_active,created_at FROM users WHERE role='lecturer' ORDER BY display_name").fetchall()
+        classes = conn.execute("SELECT id,class_code,department,semester,section FROM classes ORDER BY department,semester,section").fetchall()
+        subjects = conn.execute("SELECT id,class_id,code,name FROM subjects ORDER BY name").fetchall()
+        assignments = conn.execute("""SELECT la.id,u.display_name,u.username,c.class_code,s.code AS subject_code,s.name AS subject_name
+            FROM lecturer_assignments la JOIN users u ON u.id=la.user_id JOIN classes c ON c.id=la.class_id
+            LEFT JOIN subjects s ON s.id=la.subject_id ORDER BY u.display_name,c.class_code,s.name""").fetchall()
+    return render_template("lecturers.html", lecturers=lecturers, classes=classes, subjects=subjects,
+                           assignments=assignments, admin_user=session.get("username", "hod"))
+
+
+@app.post("/lecturers/assignments/<int:assignment_id>/delete")
+@role_required("hod")
+def delete_lecturer_assignment(assignment_id):
+    with db() as conn:
+        row = conn.execute("SELECT user_id,class_id FROM lecturer_assignments WHERE id=?", (assignment_id,)).fetchone()
+        conn.execute("DELETE FROM lecturer_assignments WHERE id=?", (assignment_id,))
+    if row:
+        audit("lecturer_assignment_revoked", "class", row["class_id"], f"user={row['user_id']}")
+        flash("Lecturer assignment revoked.", "success")
+    else:
+        flash("Assignment not found.", "error")
+    return redirect(url_for("lecturers_page"))
+
+
+@app.route("/classes/<int:class_id>/subjects", methods=["GET", "POST"])
+@role_required("hod")
+def class_subjects(class_id):
+    with db() as conn:
+        class_record = conn.execute("SELECT * FROM classes WHERE id=?", (class_id,)).fetchone()
+        if not class_record:
+            flash("Class not found.", "error")
+            return redirect(url_for("department_management"))
+        if request.method == "POST":
+            code = request.form.get("code", "").strip().upper()
+            name = request.form.get("name", "").strip()
+            if not code or not name or len(code) > 30 or len(name) > 120:
+                flash("Enter a subject code and name.", "error")
+            else:
+                try:
+                    conn.execute("INSERT INTO subjects(class_id,code,name,created_at) VALUES(?,?,?,?)",
+                                 (class_id, code, name, datetime.now().isoformat(timespec="seconds")))
+                    flash("Subject added.", "success")
+                except sqlite3.IntegrityError:
+                    flash("That subject code already exists in this class.", "error")
+            return redirect(url_for("class_subjects", class_id=class_id))
+        subjects = conn.execute("SELECT * FROM subjects WHERE class_id=? ORDER BY code", (class_id,)).fetchall()
+    return render_template("class_subjects.html", class_record=class_record, subjects=subjects,
+                           admin_user=session.get("username", "hod"))
+
+
+@app.post("/classes/<int:class_id>/subjects/<int:subject_id>/delete")
+@role_required("hod")
+def delete_subject(class_id, subject_id):
+    try:
+        with db() as conn:
+            conn.execute("DELETE FROM subjects WHERE id=? AND class_id=?", (subject_id, class_id))
+        flash("Subject deleted if it was not used by attendance history.", "success")
+    except sqlite3.IntegrityError:
+        flash("This subject has attendance history or timetable entries; remove those first.", "error")
+    return redirect(url_for("class_subjects", class_id=class_id))
+
+
+def parse_timetable_upload(file_storage):
+    """Parse and validate a CSV/XLSX timetable without writing user files to disk."""
+    filename = (file_storage.filename or "").lower()
+    required = {"day", "subject_code", "subject", "start_time", "end_time", "section", "room"}
+    if filename.endswith(".csv"):
+        text = file_storage.stream.read().decode("utf-8-sig")
+        reader = csv.DictReader(io.StringIO(text))
+        rows = [{str(k).strip().lower(): v for k, v in row.items() if k is not None} for row in reader]
+    elif filename.endswith(".xlsx"):
+        try:
+            import openpyxl
+        except ImportError as exc:
+            raise ValueError("Excel upload requires openpyxl: python -m pip install openpyxl") from exc
+        workbook = openpyxl.load_workbook(file_storage, data_only=True, read_only=True)
+        try:
+            sheet = workbook.active
+            values = list(sheet.iter_rows(values_only=True))
+        finally:
+            workbook.close()
+        if not values:
+            raise ValueError("The Excel file is empty.")
+        headers = [str(v).strip().lower() if v is not None else "" for v in values[0]]
+        rows = [{headers[i]: value for i, value in enumerate(vals) if i < len(headers) and headers[i]}
+                for vals in values[1:] if any(v is not None for v in vals)]
+    else:
+        raise ValueError("Choose a .csv or .xlsx timetable file.")
+    if not rows:
+        raise ValueError("The timetable has no data rows.")
+    errors, normalized = [], []
+    valid_days = {"monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"}
+    def parse_time(value):
+        if hasattr(value, "strftime"):
+            return value.strftime("%H:%M")
+        value = str(value).strip()
+        for fmt in ("%H:%M", "%I:%M %p", "%I:%M%p"):
+            try: return datetime.strptime(value, fmt).strftime("%H:%M")
+            except ValueError: pass
+        raise ValueError(f"Invalid time '{value}' (use HH:MM).")
+    with db() as conn:
+        classes = conn.execute("SELECT id,class_code,section,department FROM classes").fetchall()
+        for number, row in enumerate(rows, 2):
+            missing = required - set(row)
+            if missing:
+                errors.append(f"Row {number}: missing columns {', '.join(sorted(missing))}")
+                continue
+            try:
+                day = str(row.get("day", "")).strip().lower()
+                code = str(row.get("subject_code", "")).strip().upper()
+                name = str(row.get("subject", "")).strip()
+                section = str(row.get("section", "")).strip().casefold()
+                room = str(row.get("room", "") or "").strip()
+                if day not in valid_days: raise ValueError(f"Invalid day '{day}'.")
+                if not code or not name: raise ValueError("Subject code and subject are required.")
+                start, end = parse_time(row.get("start_time")), parse_time(row.get("end_time"))
+                if end <= start: raise ValueError("End time must be after start time.")
+                matches = [c for c in classes if section in {str(c['class_code']).casefold(), str(c['section']).casefold()}]
+                if len(matches) != 1:
+                    raise ValueError(f"Section '{row.get('section')}' must match exactly one class code or section value.")
+                normalized.append({"class_id": matches[0]["id"], "class_code": matches[0]["class_code"],
+                                   "day": day.title(), "code": code, "name": name,
+                                   "start": start, "end": end, "room": room, "row": number})
+            except (ValueError, TypeError) as exc:
+                errors.append(f"Row {number}: {exc}")
+    # Reject overlapping slots for the same class/day, even when subjects differ.
+    for i, a in enumerate(normalized):
+        for b in normalized[i+1:]:
+            if a["class_id"] == b["class_id"] and a["day"] == b["day"]:
+                if a["start"] < b["end"] and b["start"] < a["end"]:
+                    errors.append(f"Rows {a['row']} and {b['row']}: overlapping timetable entries for {a['class_code']} on {a['day']}.")
+    if errors:
+        raise ValueError("\n".join(errors))
+    return normalized
+
+
+@app.route("/timetable", methods=["GET", "POST"])
+@role_required("hod")
+def timetable_page():
+    if request.method == "POST":
+        upload = request.files.get("timetable_file")
+        if not upload or not upload.filename:
+            flash("Choose a CSV or XLSX timetable file.", "error")
+        else:
+            try:
+                rows = parse_timetable_upload(upload)
+                now = datetime.now().isoformat(timespec="seconds")
+                with db() as conn:
+                    # A valid upload replaces the active timetable atomically.
+                    conn.execute("DELETE FROM timetable_entries")
+                    for row in rows:
+                        subject = conn.execute("SELECT id FROM subjects WHERE class_id=? AND upper(code)=upper(?)",
+                                               (row["class_id"], row["code"])).fetchone()
+                        if subject:
+                            subject_id = subject["id"]
+                            conn.execute("UPDATE subjects SET name=? WHERE id=?", (row["name"], subject_id))
+                        else:
+                            subject_id = conn.execute("INSERT INTO subjects(class_id,code,name,created_at) VALUES(?,?,?,?)",
+                                                      (row["class_id"], row["code"], row["name"], now)).lastrowid
+                        conn.execute("INSERT INTO timetable_entries(class_id,subject_id,day_of_week,start_time,end_time,room,created_at) VALUES(?,?,?,?,?,?,?)",
+                                     (row["class_id"], subject_id, row["day"], row["start"], row["end"], row["room"], now))
+                audit("timetable_imported", "timetable", "all", f"{len(rows)} entries")
+                flash(f"Imported {len(rows)} timetable entries. Automatic launch runs while app.py is running on the camera computer.", "success")
+            except (ValueError, sqlite3.Error) as exc:
+                flash(f"Timetable import failed: {exc}", "error")
+        return redirect(url_for("timetable_page"))
+    with db() as conn:
+        entries = conn.execute("""SELECT t.*,c.class_code,s.code AS subject_code,s.name AS subject_name
+            FROM timetable_entries t JOIN classes c ON c.id=t.class_id JOIN subjects s ON s.id=t.subject_id
+            ORDER BY CASE t.day_of_week WHEN 'Monday' THEN 1 WHEN 'Tuesday' THEN 2 WHEN 'Wednesday' THEN 3 WHEN 'Thursday' THEN 4 WHEN 'Friday' THEN 5 WHEN 'Saturday' THEN 6 ELSE 7 END,t.start_time,c.class_code""").fetchall()
+    return render_template("timetable.html", entries=entries, admin_user=session.get("username", "hod"))
+
+
+@app.get("/classes/<int:class_id>/timetable")
+@class_access_required
+def class_timetable(class_id):
+    with db() as conn:
+        class_record = conn.execute("SELECT * FROM classes WHERE id=?", (class_id,)).fetchone()
+        entries = conn.execute("""SELECT t.*,s.code AS subject_code,s.name AS subject_name FROM timetable_entries t
+            JOIN subjects s ON s.id=t.subject_id WHERE t.class_id=? ORDER BY CASE t.day_of_week WHEN 'Monday' THEN 1 WHEN 'Tuesday' THEN 2 WHEN 'Wednesday' THEN 3 WHEN 'Thursday' THEN 4 WHEN 'Friday' THEN 5 WHEN 'Saturday' THEN 6 ELSE 7 END,t.start_time""", (class_id,)).fetchall()
+        if session.get("role") == "lecturer":
+            all_subjects = conn.execute("SELECT 1 FROM lecturer_assignments WHERE user_id=? AND class_id=? AND subject_id IS NULL", (session["user_id"], class_id)).fetchone()
+            if not all_subjects:
+                allowed = {r[0] for r in conn.execute("SELECT subject_id FROM lecturer_assignments WHERE user_id=? AND class_id=? AND subject_id IS NOT NULL", (session["user_id"], class_id))}
+                entries = [e for e in entries if e["subject_id"] in allowed]
+    return render_template("class_timetable.html", class_record=class_record, entries=entries,
+                           admin_user=session.get("username", "lecturer"))
+
+
+def create_attendance_session(class_id, subject_id, session_date, start_time, end_time, source_timetable_id=None):
+    now = datetime.now().isoformat(timespec="seconds")
+    with db() as conn:
+        if source_timetable_id is not None:
+            existing = conn.execute("SELECT id FROM attendance_sessions WHERE source_timetable_id=? AND session_date=?",
+                                    (source_timetable_id, session_date)).fetchone()
+            if existing:
+                return existing["id"], False
+        # Also prevent a re-imported timetable (new entry ID) from duplicating the same class/subject slot.
+        existing_slot = conn.execute("SELECT id FROM attendance_sessions WHERE class_id=? AND subject_id=? AND session_date=? AND start_time=?",
+                                     (class_id, subject_id, session_date, start_time)).fetchone()
+        if existing_slot:
+            return existing_slot["id"], False
+        cur = conn.execute("""INSERT INTO attendance_sessions(class_id,subject_id,session_date,start_time,end_time,status,source_timetable_id,created_at)
+            VALUES(?,?,?,?,?,'scheduled',?,?)""", (class_id, subject_id, session_date, start_time, end_time, source_timetable_id, now))
+        return cur.lastrowid, True
+
+
+def launch_class_attendance(session_id, class_id):
+    script = BASE_DIR / "class_attendance_web.py"
+    if not script.is_file():
+        raise FileNotFoundError("class_attendance_web.py is missing from the project folder.")
+    process = subprocess.Popen([sys.executable, str(script), "--session-id", str(session_id), "--class-id", str(class_id)], cwd=str(BASE_DIR))
+    return process.pid
+
+
+@app.route("/classes/<int:class_id>/attendance", methods=["GET", "POST"])
+@class_access_required
+def class_attendance_page(class_id):
+    with db() as conn:
+        class_record = conn.execute("SELECT * FROM classes WHERE id=?", (class_id,)).fetchone()
+        subjects = conn.execute("SELECT * FROM subjects WHERE class_id=? ORDER BY code", (class_id,)).fetchall()
+    if not class_record:
+        flash("Class not found.", "error")
+        return redirect(url_for("lecturer_dashboard" if session.get("role") == "lecturer" else "department_management"))
+    if session.get("role") == "lecturer":
+        with db() as conn:
+            class_wide = conn.execute("SELECT 1 FROM lecturer_assignments WHERE user_id=? AND class_id=? AND subject_id IS NULL", (session["user_id"], class_id)).fetchone()
+            allowed_subjects = {r[0] for r in conn.execute("SELECT subject_id FROM lecturer_assignments WHERE user_id=? AND class_id=? AND subject_id IS NOT NULL", (session["user_id"], class_id))}
+        if not class_wide:
+            subjects = [s for s in subjects if s["id"] in allowed_subjects]
+    if request.method == "POST":
+        session_id = None
+        try:
+            subject_id = int(request.form.get("subject_id", ""))
+            subject = next((s for s in subjects if s["id"] == subject_id), None)
+            if not subject:
+                raise ValueError("Choose a subject assigned to you and belonging to this class.")
+            now = datetime.now()
+            start = now.strftime("%H:%M")
+            end = (now + timedelta(minutes=60)).strftime("%H:%M")
+            session_id, _created = create_attendance_session(class_id, subject_id, now.date().isoformat(), start, end)
+            with db() as conn:
+                conn.execute("UPDATE attendance_sessions SET status='running',started_at=?,launch_attempts=launch_attempts+1 WHERE id=? AND status IN ('scheduled','failed')",
+                             (now.isoformat(timespec="seconds"), session_id))
+            pid = launch_class_attendance(session_id, class_id)
+            with db() as conn:
+                conn.execute("UPDATE attendance_sessions SET process_id=? WHERE id=?", (pid, session_id))
+            audit("attendance_started_manually", "session", session_id, f"class={class_id}; subject={subject['name']}")
+            flash(f"Attendance camera launched for {subject['name']}.", "success")
+        except (ValueError, OSError, sqlite3.Error) as exc:
+            if session_id is not None:
+                with db() as conn:
+                    conn.execute("UPDATE attendance_sessions SET status='failed',process_id=NULL WHERE id=? AND status='running'", (session_id,))
+            flash(f"Could not start attendance: {exc}", "error")
+        return redirect(url_for("class_attendance_page", class_id=class_id))
+    with db() as conn:
+        sessions = conn.execute("""SELECT a.*,s.code AS subject_code,s.name AS subject_name,
+            (SELECT COUNT(*) FROM attendance_records r WHERE r.session_id=a.id AND r.status='Present') AS present_count
+            FROM attendance_sessions a JOIN subjects s ON s.id=a.subject_id WHERE a.class_id=?
+            ORDER BY a.session_date DESC,a.start_time DESC LIMIT 100""", (class_id,)).fetchall()
+        if session.get("role") == "lecturer":
+            class_wide = conn.execute("SELECT 1 FROM lecturer_assignments WHERE user_id=? AND class_id=? AND subject_id IS NULL", (session["user_id"], class_id)).fetchone()
+            if not class_wide:
+                sessions = [r for r in sessions if r["subject_id"] in allowed_subjects]
+    return render_template("class_attendance.html", class_record=class_record, subjects=subjects, sessions=sessions,
+                           admin_user=session.get("username", "user"))
+
+
+@app.get("/classes/<int:class_id>/sessions/<int:session_id>")
+@class_access_required
+def class_session_report(class_id, session_id):
+    with db() as conn:
+        session_row = conn.execute("""SELECT a.*,c.class_code,s.code AS subject_code,s.name AS subject_name
+            FROM attendance_sessions a JOIN classes c ON c.id=a.class_id JOIN subjects s ON s.id=a.subject_id
+            WHERE a.id=? AND a.class_id=?""", (session_id, class_id)).fetchone()
+        if not session_row:
+            flash("Session not found.", "error")
+            return redirect(url_for("class_attendance_page", class_id=class_id))
+        if session.get("role") == "lecturer":
+            allowed = conn.execute("SELECT 1 FROM lecturer_assignments WHERE user_id=? AND class_id=? AND (subject_id IS NULL OR subject_id=?) LIMIT 1",
+                                   (session["user_id"], class_id, session_row["subject_id"])).fetchone()
+            if not allowed:
+                return render_template("forbidden.html"), 403
+        assigned = {r[0] for r in conn.execute("SELECT roll FROM class_students WHERE class_id=?", (class_id,))}
+        students = load_students()
+        present = {r["roll"]: r for r in conn.execute("SELECT * FROM attendance_records WHERE session_id=?", (session_id,))}
+        rows = []
+        for roll in sorted(assigned):
+            student = students.get(roll, {"name": "Unknown", "enrolled": False})
+            record = present.get(roll)
+            rows.append({"roll": roll, "name": student["name"], "status": record["status"] if record else "Absent / not marked",
+                         "time": record["marked_at"] if record else "—"})
+    return render_template("class_session_report.html", session_row=session_row, rows=rows,
+                           admin_user=session.get("username", "user"))
+
+
+def scheduler_tick(now=None):
+    """Launch scheduled sessions once per timetable entry/date; start only within a 30-minute grace window."""
+    now = now or datetime.now()
+    day_name = now.strftime("%A")
+    current = now.strftime("%H:%M")
+    lower = (now - timedelta(minutes=30)).strftime("%H:%M")
+    with db() as conn:
+        entries = conn.execute("""SELECT t.*,s.name AS subject_name FROM timetable_entries t
+            JOIN subjects s ON s.id=t.subject_id WHERE t.is_active=1 AND t.day_of_week=? AND t.start_time<=? AND t.start_time>=?""",
+            (day_name, current, lower)).fetchall()
+    for entry in entries:
+        session_id = None
+        try:
+            session_id, created = create_attendance_session(entry["class_id"], entry["subject_id"], now.date().isoformat(),
+                                                            entry["start_time"], entry["end_time"], entry["id"])
+            with db() as conn:
+                existing = conn.execute("SELECT status,process_id,launch_attempts FROM attendance_sessions WHERE id=?", (session_id,)).fetchone()
+            if not created and existing:
+                if existing["status"] in ("completed",):
+                    continue
+                if existing["status"] == "running" and existing["process_id"]:
+                    try:
+                        os.kill(int(existing["process_id"]), 0)
+                        continue  # the previous camera process is still alive
+                    except (OSError, ValueError, TypeError):
+                        pass  # stale process record; safe to recover the existing session
+                if existing["launch_attempts"] >= 2:
+                    continue
+            with db() as conn:
+                conn.execute("""UPDATE attendance_sessions SET status='running',started_at=COALESCE(started_at,?),
+                    launch_attempts=launch_attempts+1 WHERE id=?""", (now.isoformat(timespec="seconds"), session_id))
+            pid = launch_class_attendance(session_id, entry["class_id"])
+            with db() as conn:
+                conn.execute("UPDATE attendance_sessions SET process_id=? WHERE id=?", (pid, session_id))
+            audit("attendance_auto_started", "session", session_id, f"timetable={entry['id']}")
+        except Exception as exc:
+            if session_id:
+                with db() as conn:
+                    conn.execute("UPDATE attendance_sessions SET status='failed',process_id=NULL WHERE id=?", (session_id,))
+            print(f"[scheduler] Could not launch timetable entry {entry['id']}: {exc}")
+
+
+def scheduler_loop():
+    import time
+    print("[scheduler] Timetable scheduler active; automatic attendance starts when a scheduled slot is reached (30-minute catch-up window).")
+    while True:
+        try:
+            scheduler_tick()
+        except Exception as exc:
+            print(f"[scheduler] {exc}")
+        time.sleep(15)
+
+
 @app.get("/health")
 def health():
     return jsonify({"status": "ok"})
@@ -506,4 +1331,6 @@ if __name__ == "__main__":
     print("Smart Attendance Dashboard: http://127.0.0.1:5000")
     if not has_users:
         print("First run: open http://127.0.0.1:5000/setup to create the HOD account.")
+    import threading
+    threading.Thread(target=scheduler_loop, name="attendance-scheduler", daemon=True).start()
     app.run(host="127.0.0.1", port=5000, debug=False)

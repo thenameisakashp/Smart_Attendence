@@ -1,0 +1,12 @@
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+dataset/*.db
+dataset/*.db-shm
+dataset/*.db-wal
+dataset/face_features.json
+dataset/timetable.json
+attendance_records/*.csv
+*.log
+.env
