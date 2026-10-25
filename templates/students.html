@@ -1,3 +1,286 @@
-<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Students | Smart Attendance</title><link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}"></head><body><div class="layout"><aside class="sidebar"><div class="brand"><span class="brand-icon">SA</span><div><b>Smart Attendance</b><small>FACE RECOGNITION</small></div></div><nav><span class="nav-label">WORKSPACE</span><a href="{{ url_for('index') }}">▦ Dashboard</a><a class="active" href="{{ url_for('students_page') }}">♙ Students</a></nav><div class="side-bottom"><span class="online"></span><div><b>Local system</b><small>Signed in as {{ admin_user }}</small></div><form method="post" action="{{ url_for('logout') }}"><button class="logout">Log out</button></form></div></aside><main class="main"><header class="topbar"><div><div class="eyebrow">WORKSPACE / STUDENTS</div><h1>Student management</h1><p>Edit dashboard names, add pending students, and open reports.</p></div><a class="button ghost" href="{{ url_for('index') }}">← Dashboard</a></header>{% with messages = get_flashed_messages(with_categories=true) %}{% if messages %}{% for category,message in messages %}<div class="flash {{ category }}">{{ message }}</div>{% endfor %}{% endif %}{% endwith %}
-<section class="panel add-panel"><div><h3>Add a student</h3><p>New entries are pending until face enrollment is completed in your existing student manager.</p></div><form method="post" action="{{ url_for('add_student') }}" class="add-form"><label>Roll number<input name="roll" maxlength="80" required></label><label>Full name<input name="name" maxlength="120" required></label><button class="button primary">Add pending student</button></form></section>
-<section class="panel"><div class="panel-head"><div><h3>Registered and pending students</h3><p>Face-enrolled records are kept read-only in the original recognition file.</p></div><span class="pill">{{ students|length }} students</span></div><div class="table-wrap"><table><thead><tr><th>ROLL</th><th>STUDENT NAME</th><th>ENROLLMENT</th><th>ACTIONS</th></tr></thead><tbody>{% for s in students %}<tr><td><code>{{ s.roll }}</code></td><td><form class="inline-edit" method="post" action="{{ url_for('edit_student', roll=s.roll) }}"><input name="name" value="{{ s.name }}" required maxlength="120"><button class="button small">Save name</button></form></td><td><span class="status {{ 'present' if s.enrolled else 'pending' }}">{{ 'Face enrolled' if s.enrolled else 'Pending enrollment' }}</span></td><td><div class="actions"><a class="text-link" href="{{ url_for('student_report', roll=s.roll) }}">Report ↗</a><form method="post" action="{{ url_for('delete_student', roll=s.roll) }}" onsubmit="return confirm('Remove dashboard override/pending entry? Face-enrolled data will not be deleted.')"><button class="button small danger">Remove override</button></form></div></td></tr>{% else %}<tr><td colspan="4" class="empty">No students found. Check dataset/face_features.json.</td></tr>{% endfor %}</tbody></table></div></section><div class="notice"><b>Important:</b> This dashboard deliberately does not edit or delete face embeddings. Use your existing student manager to enroll or remove a student's face safely.</div><footer>SMART ATTENDANCE <span>•</span> STUDENT MANAGEMENT</footer></main></div></body></html>
+```html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+    <title>Students | Smart Attendance</title>
+
+    <link rel="stylesheet"
+          href="{{ url_for('static', filename='style.css') }}">
+</head>
+
+<body>
+<div class="layout">
+
+    <!-- SIDEBAR -->
+    <aside class="sidebar">
+
+        <div class="brand">
+            <span class="brand-icon">SA</span>
+
+            <div>
+                <b>Smart Attendance</b>
+                <small>FACE RECOGNITION</small>
+            </div>
+        </div>
+
+        <nav>
+            <span class="nav-label">WORKSPACE</span>
+
+            <a href="{{ url_for('index') }}">▦ Dashboard</a>
+
+            <a class="active" href="{{ url_for('students_page') }}">
+                ♙ Students
+            </a>
+        </nav>
+
+        <div class="side-bottom">
+
+            <span class="online"></span>
+
+            <div>
+                <b>Local system</b>
+                <small>Signed in as {{ admin_user }}</small>
+            </div>
+
+            <form method="post" action="{{ url_for('logout') }}">
+                <button class="logout" type="submit">Log out</button>
+            </form>
+
+        </div>
+
+    </aside>
+
+
+    <!-- MAIN CONTENT -->
+    <main class="main">
+
+        <!-- HEADER -->
+        <header class="topbar">
+
+            <div>
+                <div class="eyebrow">WORKSPACE / STUDENTS</div>
+
+                <h1>Student management</h1>
+
+                <p>
+                    View student records, edit display names,
+                    and access attendance reports.
+                </p>
+            </div>
+
+            <div class="top-actions">
+
+                <a class="button ghost" href="{{ url_for('index') }}">
+                    ← Dashboard
+                </a>
+
+                <form method="post"
+                      action="{{ url_for('launch_student_manager') }}">
+
+                    <button class="button primary" type="submit">
+                        + Register Student / Capture Face
+                    </button>
+
+                </form>
+
+            </div>
+
+        </header>
+
+
+        <!-- FLASH MESSAGES -->
+        {% with messages = get_flashed_messages(with_categories=true) %}
+
+            {% if messages %}
+
+                {% for category, message in messages %}
+
+                    <div class="flash {{ category }}">
+                        {{ message }}
+                    </div>
+
+                {% endfor %}
+
+            {% endif %}
+
+        {% endwith %}
+
+
+        <!-- STUDENT LIST -->
+        <section class="panel">
+
+            <div class="panel-head">
+
+                <div>
+                    <h3>Registered and pending students</h3>
+
+                    <p>
+                        Student registration is handled through the
+                        desktop application. Existing records can be
+                        managed below.
+                    </p>
+                </div>
+
+                <span class="pill">
+                    {{ students|length }} students
+                </span>
+
+            </div>
+
+
+            <!-- STUDENT TABLE -->
+            <div class="table-wrap">
+
+                <table>
+
+                    <thead>
+                        <tr>
+                            <th>USN / ROLL NUMBER</th>
+                            <th>STUDENT NAME</th>
+                            <th>ENROLLMENT STATUS</th>
+                            <th>ACTIONS</th>
+                        </tr>
+                    </thead>
+
+                    <tbody>
+
+                        {% for s in students %}
+
+                        <tr>
+
+                            <!-- USN: DISPLAY ONLY -->
+                            <td>
+                                <code>{{ s.roll }}</code>
+                            </td>
+
+
+                            <!-- EDITABLE STUDENT NAME -->
+                            <td>
+
+                                <form class="inline-edit"
+                                      method="post"
+                                      action="{{ url_for('edit_student', roll=s.roll) }}">
+
+                                    <input
+                                        type="text"
+                                        name="name"
+                                        value="{{ s.name }}"
+                                        maxlength="120"
+                                        required
+                                        aria-label="Student display name">
+
+                                    <button class="button small" type="submit">
+                                        Save Name
+                                    </button>
+
+                                </form>
+
+                            </td>
+
+
+                            <!-- ENROLLMENT STATUS -->
+                            <td>
+
+                                <span class="status {{ 'present' if s.enrolled else 'pending' }}">
+
+                                    {% if s.enrolled %}
+                                        Face enrolled
+                                    {% else %}
+                                        Pending enrollment
+                                    {% endif %}
+
+                                </span>
+
+                            </td>
+
+
+                            <!-- ACTIONS -->
+                            <td>
+
+                                <div class="actions">
+
+                                    <a class="text-link"
+                                       href="{{ url_for('student_report', roll=s.roll) }}">
+                                        View Report ↗
+                                    </a>
+
+                                    <form
+                                        method="post"
+                                        action="{{ url_for('delete_student', roll=s.roll) }}"
+                                        onsubmit="return confirm('Remove this dashboard name override or pending entry? Face-enrolled data will not be deleted.');">
+
+                                        <button
+                                            class="button small danger"
+                                            type="submit">
+                                            Remove Override
+                                        </button>
+
+                                    </form>
+
+                                </div>
+
+                            </td>
+
+                        </tr>
+
+                        {% else %}
+
+                        <tr>
+                            <td colspan="4" class="empty">
+                                No students found. Check
+                                dataset/face_features.json and register
+                                students through the desktop application.
+                            </td>
+                        </tr>
+
+                        {% endfor %}
+
+                    </tbody>
+
+                </table>
+
+            </div>
+
+        </section>
+
+
+        <!-- INFORMATION NOTICE -->
+        <div class="notice">
+
+            <b>Student Registration:</b>
+
+            Use the Tkinter desktop application to enter new student
+            details and capture faces.
+
+            <br><br>
+
+            <b>Edit Name:</b>
+
+            Use Save Name to update the student's displayed name.
+
+            <br><br>
+
+            <b>Remove Override:</b>
+
+            This removes the dashboard name override or pending record.
+            It does not delete face embeddings from the recognition file.
+
+        </div>
+
+
+        <!-- FOOTER -->
+        <footer>
+            SMART ATTENDANCE
+            <span>•</span>
+            STUDENT MANAGEMENT
+        </footer>
+
+    </main>
+
+</div>
+</body>
+</html>
+```

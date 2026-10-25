@@ -2,7 +2,8 @@ from flask import Flask, render_template, request, Response, redirect, url_for, 
 from pathlib import Path
 from datetime import datetime, date, timedelta
 from functools import wraps
-import csv, json, io, os, sqlite3, subprocess, sys, calendar
+import csv, json, io, os, sqlite3, subprocess, sys, calendar, secrets
+from werkzeug.security import generate_password_hash, check_password_hash
 from collections import defaultdict
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -13,9 +14,16 @@ ATTENDANCE_DIR.mkdir(parents=True, exist_ok=True)
 DASHBOARD_DB.parent.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__)
-app.secret_key = os.environ.get("SMART_ATTENDANCE_SECRET", "change-this-secret-before-sharing")
-ADMIN_USER = os.environ.get("SMART_ATTENDANCE_ADMIN_USER", "admin")
-ADMIN_PASSWORD = os.environ.get("SMART_ATTENDANCE_ADMIN_PASSWORD", "ChangeMe123!")
+# Persist a randomly generated secret locally unless an environment secret is supplied.
+SECRET_FILE = DASHBOARD_DB.parent / ".flask_secret"
+if os.environ.get("SMART_ATTENDANCE_SECRET"):
+    app.secret_key = os.environ["SMART_ATTENDANCE_SECRET"]
+else:
+    DASHBOARD_DB.parent.mkdir(parents=True, exist_ok=True)
+    if not SECRET_FILE.exists():
+        SECRET_FILE.write_text(secrets.token_hex(32), encoding="utf-8")
+    app.secret_key = SECRET_FILE.read_text(encoding="utf-8").strip()
+app.config.update(SESSION_COOKIE_HTTPONLY=True, SESSION_COOKIE_SAMESITE="Lax")
 app.config["MAX_CONTENT_LENGTH"] = 5 * 1024 * 1024
 
 
@@ -32,15 +40,38 @@ def init_db():
         conn.execute("""CREATE TABLE IF NOT EXISTS pending_students (
             roll TEXT PRIMARY KEY, full_name TEXT NOT NULL, created_at TEXT NOT NULL,
             note TEXT NOT NULL DEFAULT 'Register face using the existing student manager')""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE,
+            password_hash TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('hod','lecturer')),
+            display_name TEXT NOT NULL, is_active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL)""")
 
 
 def login_required(fn):
     @wraps(fn)
     def wrapped(*args, **kwargs):
-        if not session.get("admin_logged_in"):
+        if not session.get("user_id"):
             return redirect(url_for("login", next=request.path))
+        with db() as conn:
+            user = conn.execute("SELECT id, username, role, display_name, is_active FROM users WHERE id=?",
+                                (session["user_id"],)).fetchone()
+        if not user or not user["is_active"]:
+            session.clear()
+            return redirect(url_for("login"))
         return fn(*args, **kwargs)
     return wrapped
+
+
+def role_required(*roles):
+    def decorator(fn):
+        @wraps(fn)
+        @login_required
+        def wrapped(*args, **kwargs):
+            if session.get("role") not in roles:
+                return render_template("forbidden.html"), 403
+            return fn(*args, **kwargs)
+        return wrapped
+    return decorator
 
 
 def load_students():
@@ -160,21 +191,57 @@ def student_attendance_stats(roll, days=30):
     return {"present_days": present_count, "tracked_days": days, "rate": rate, "records": records}
 
 
-@app.route("/login", methods=["GET", "POST"])
-def login():
-    if session.get("admin_logged_in"):
-        return redirect(url_for("index"))
+@app.route("/setup", methods=["GET", "POST"])
+def setup():
+    with db() as conn:
+        count = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+    if count:
+        return redirect(url_for("login"))
     error = None
     if request.method == "POST":
-        username = request.form.get("username", "")
+        username = request.form.get("username", "").strip()
+        display_name = request.form.get("display_name", "").strip()
         password = request.form.get("password", "")
-        if username == ADMIN_USER and password == ADMIN_PASSWORD:
+        confirm = request.form.get("confirm_password", "")
+        if not username or not display_name:
+            error = "Enter your name and username."
+        elif len(username) > 80 or len(display_name) > 120:
+            error = "Name or username is too long."
+        elif len(password) < 12:
+            error = "Use a password with at least 12 characters."
+        elif password != confirm:
+            error = "Passwords do not match."
+        else:
+            with db() as conn:
+                conn.execute("INSERT INTO users(username,password_hash,role,display_name,created_at) VALUES(?,?,?,?,?)",
+                             (username, generate_password_hash(password), "hod", display_name, datetime.now().isoformat(timespec="seconds")))
+            flash("HOD account created. Sign in to continue.", "success")
+            return redirect(url_for("login"))
+    return render_template("setup.html", error=error)
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if session.get("user_id"):
+        return redirect(url_for("index" if session.get("role") == "hod" else "lecturer_dashboard"))
+    error = None
+    if request.method == "POST":
+        username = request.form.get("username", "").strip()
+        password = request.form.get("password", "")
+        with db() as conn:
+            user = conn.execute("SELECT * FROM users WHERE username=?", (username,)).fetchone()
+        if user and user["is_active"] and check_password_hash(user["password_hash"], password):
             session.clear()
-            session["admin_logged_in"] = True
-            session["admin_user"] = username
-            return redirect(request.args.get("next") or url_for("index"))
-        error = "Invalid username or password."
-    return render_template("login.html", error=error)
+            session["user_id"] = user["id"]
+            session["username"] = user["username"]
+            session["display_name"] = user["display_name"]
+            session["role"] = user["role"]
+            destination = "index" if user["role"] == "hod" else "lecturer_dashboard"
+            return redirect(url_for(destination))
+        error = "Invalid username or password, or account disabled."
+    with db() as conn:
+        has_users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] > 0
+    return render_template("login.html", error=error, has_users=has_users)
 
 
 @app.post("/logout")
@@ -184,8 +251,32 @@ def logout():
     return redirect(url_for("login"))
 
 
+@app.route("/lecturer")
+@role_required("lecturer")
+def lecturer_dashboard():
+    return render_template("lecturer_dashboard.html", display_name=session.get("display_name", "Lecturer"), username=session.get("username", ""))
+
+
+@app.post("/launch-student-manager")
+@role_required("hod", "lecturer")
+def launch_student_manager():
+    """Launch the existing desktop face-registration UI on the machine running Flask."""
+    script = BASE_DIR / "student_manager.py"
+    if not script.is_file():
+        flash("student_manager.py was not found. Put it in the same project folder as app.py.", "error")
+    else:
+        try:
+            subprocess.Popen([sys.executable, str(script)], cwd=str(BASE_DIR))
+            flash("Student Manager opened on the computer running this dashboard. Complete face capture in its window.", "success")
+        except OSError as exc:
+            flash(f"Could not open student_manager.py: {exc}", "error")
+    if session.get("role") == "lecturer":
+        return redirect(url_for("lecturer_dashboard"))
+    return redirect(url_for("index"))
+
+
 @app.route("/")
-@login_required
+@role_required("hod")
 def index():
     selected_date = request.args.get("date", date.today().isoformat())
     try:
@@ -196,11 +287,11 @@ def index():
     data = dashboard_data(selected_date, search)
     return render_template("dashboard.html", data=data, selected_date=selected_date, search=search,
                            today=date.today().isoformat(), generated_at=datetime.now().strftime("%d %b %Y, %I:%M %p"),
-                           admin_user=session.get("admin_user", "admin"))
+                           admin_user=session.get("username", "hod"), display_name=session.get("display_name", "HOD"))
 
 
 @app.get("/api/analytics")
-@login_required
+@role_required("hod")
 def analytics_api():
     days = []
     for i in range(13, -1, -1):
@@ -227,14 +318,14 @@ def analytics_api():
 
 
 @app.get("/students")
-@login_required
+@role_required("hod")
 def students_page():
     students = sorted(load_students().values(), key=lambda s: (s["name"].lower(), s["roll"]))
     return render_template("students.html", students=students, admin_user=session.get("admin_user", "admin"))
 
 
 @app.post("/students/add")
-@login_required
+@role_required("hod")
 def add_student():
     roll = request.form.get("roll", "").strip()
     name = request.form.get("name", "").strip()
@@ -253,7 +344,7 @@ def add_student():
 
 
 @app.post("/students/<path:roll>/edit")
-@login_required
+@role_required("hod")
 def edit_student(roll):
     name = request.form.get("name", "").strip()
     students = load_students()
@@ -276,7 +367,7 @@ def edit_student(roll):
 
 
 @app.post("/students/<path:roll>/delete")
-@login_required
+@role_required("hod")
 def delete_student(roll):
     # Delete only dashboard metadata/pending records; never mutate the face embedding file.
     with db() as conn:
@@ -287,7 +378,7 @@ def delete_student(roll):
 
 
 @app.get("/student/<path:roll>")
-@login_required
+@role_required("hod")
 def student_report(roll):
     students = load_students()
     if roll not in students:
@@ -305,7 +396,7 @@ def student_report(roll):
 
 
 @app.get("/export")
-@login_required
+@role_required("hod")
 def export_csv():
     selected_date = request.args.get("date", date.today().isoformat())
     data = dashboard_data(selected_date, request.args.get("q", "").strip())
@@ -319,7 +410,7 @@ def export_csv():
 
 
 @app.get("/export.xlsx")
-@login_required
+@role_required("hod")
 def export_excel():
     try:
         from openpyxl import Workbook
@@ -352,7 +443,7 @@ def export_excel():
 
 
 @app.get("/export.pdf")
-@login_required
+@role_required("hod")
 def export_pdf():
     try:
         from reportlab.lib import colors
@@ -389,7 +480,7 @@ def export_pdf():
 
 
 @app.post("/start-attendance")
-@login_required
+@role_required("hod")
 def start_attendance():
     script = BASE_DIR / "attendance.py"
     if not script.exists():
@@ -410,5 +501,9 @@ def health():
 
 init_db()
 if __name__ == "__main__":
+    with db() as conn:
+        has_users = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0] > 0
     print("Smart Attendance Dashboard: http://127.0.0.1:5000")
+    if not has_users:
+        print("First run: open http://127.0.0.1:5000/setup to create the HOD account.")
     app.run(host="127.0.0.1", port=5000, debug=False)

@@ -104,11 +104,8 @@ class SmartAttendanceDashboard:
 
         self.add_sidebar_button(
             sidebar,
-            "👨‍🎓  Students",
-            lambda: messagebox.showinfo(
-                "Students",
-                "Student management will be added in the next step."
-            )
+            "👨‍🎓  Students / Register",
+            self.register_student
         )
 
         self.add_sidebar_button(
@@ -527,7 +524,10 @@ class SmartAttendanceDashboard:
 
     def start_attendance(self):
 
-        if not os.path.exists("attendance.py"):
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        attendance_path = os.path.join(base_dir, "attendance.py")
+
+        if not os.path.isfile(attendance_path):
             messagebox.showerror(
                 "Missing File",
                 "Could not find attendance.py."
@@ -535,10 +535,10 @@ class SmartAttendanceDashboard:
             return
 
         try:
-            subprocess.Popen([
-                sys.executable,
-                "attendance.py"
-            ])
+            subprocess.Popen(
+                [sys.executable, attendance_path],
+                cwd=base_dir
+            )
 
             self.root.after(
                 1500,
@@ -560,30 +560,37 @@ class SmartAttendanceDashboard:
     # ---------------- REGISTER STUDENT ----------------
 
     def register_student(self):
+        """
+        Open the existing Tkinter student manager, which handles face capture
+        and saving student details.
+        """
+        base_dir = os.path.dirname(os.path.abspath(__file__))
+        manager_path = os.path.join(base_dir, "student_manager.py")
 
-        if not os.path.exists("register_student.py"):
+        if not os.path.isfile(manager_path):
             messagebox.showerror(
                 "Missing File",
-                "Could not find register_student.py."
+                "Could not find student_manager.py.\n\n"
+                f"Expected location:\n{manager_path}\n\n"
+                "Make sure student_manager.py is in the same folder as "
+                "the dashboard file."
             )
             return
 
         try:
-            subprocess.Popen([
-                sys.executable,
-                "register_student.py"
-            ])
-
-            messagebox.showinfo(
-                "Registration",
-                "Student registration started.\n"
-                "Complete registration in the terminal and webcam window."
+            subprocess.Popen(
+                [sys.executable, manager_path],
+                cwd=base_dir
             )
-
+            messagebox.showinfo(
+                "Student Registration",
+                "Student Manager has been opened.\n"
+                "Complete the form and face capture in that window."
+            )
         except OSError as error:
             messagebox.showerror(
                 "Launch Error",
-                f"Could not start registration:\n{error}"
+                f"Could not start student_manager.py:\n{error}"
             )
 
     # ---------------- TIMETABLE MANAGER ----------------
