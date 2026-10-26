@@ -7,6 +7,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 from pathlib import Path
 from datetime import datetime
+from camera_utils import open_camera
 
 
 # =====================================================
@@ -550,16 +551,11 @@ class ClassAttendanceApp:
 
             self.detector, self.recognizer = load_models()
 
-            self.cap = cv2.VideoCapture(0)
-
-            if not self.cap.isOpened():
-                self.cap.release()
+            try:
+                self.cap = open_camera(cv2)
+            except RuntimeError as error:
                 self.cap = None
-
-                messagebox.showerror(
-                    "Camera Error",
-                    "Could not open webcam."
-                )
+                messagebox.showerror("Camera Error", str(error), parent=self.root)
                 return
 
             self.session_id = create_session(

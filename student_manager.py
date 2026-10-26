@@ -1,9 +1,12 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
 import json
+import sqlite3
 import cv2
 import numpy as np
 from pathlib import Path
+from datetime import datetime
+from camera_utils import open_camera
 
 from database import (
     initialize_database,
@@ -18,6 +21,7 @@ from database import (
 BASE_DIR = Path(__file__).resolve().parent
 DATASET_DIR = BASE_DIR / "dataset"
 FEATURES_FILE = DATASET_DIR / "face_features.json"
+DASHBOARD_DATABASE_FILE = DATASET_DIR / "dashboard_admin.db"
 
 DETECTOR_MODEL = BASE_DIR / "models" / "face_detection_yunet_2023mar.onnx"
 RECOGNIZER_MODEL = BASE_DIR / "models" / "face_recognition_sface_2021dec.onnx"
@@ -69,6 +73,34 @@ def save_face_database(data):
                 temporary_file.unlink()
             except OSError:
                 pass
+
+
+def assign_registered_student_to_web_class(roll_number, section_id):
+    """Link a newly registered student to the web class mirrored into this section."""
+    if not DASHBOARD_DATABASE_FILE.exists():
+        return False
+    connection = None
+    try:
+        connection = sqlite3.connect(str(DASHBOARD_DATABASE_FILE), timeout=5)
+        connection.execute("PRAGMA foreign_keys = ON")
+        mapping = connection.execute(
+            "SELECT web_class_id FROM web_class_sync WHERE section_id=?",
+            (section_id,),
+        ).fetchone()
+        if mapping is None:
+            return False
+        connection.execute(
+            "INSERT OR IGNORE INTO class_students(class_id,roll,assigned_at) VALUES(?,?,?)",
+            (mapping[0], roll_number, datetime.now().isoformat(timespec="seconds")),
+        )
+        connection.commit()
+        return True
+    except sqlite3.Error:
+        # Registration remains successful if the dashboard database is unavailable.
+        return False
+    finally:
+        if connection is not None:
+            connection.close()
 
 
 def _normalize_embedding(value):
@@ -221,13 +253,7 @@ def capture_face_embedding():
         "",
     )
 
-    cap = cv2.VideoCapture(0)
-
-    if not cap.isOpened():
-        cap.release()
-        raise RuntimeError(
-            "Could not open webcam. Check your camera connection."
-        )
+    cap = open_camera(cv2)
 
     features = []
 
@@ -830,11 +856,16 @@ class StudentManager:
                     )
                 raise
 
+            linked_to_class = assign_registered_student_to_web_class(
+                roll_number, section_id
+            )
+
             messagebox.showinfo(
                 "Success",
                 f"Student registered successfully!\n\n"
                 f"Name: {full_name}\n"
-                f"Roll Number: {roll_number}",
+                f"Roll Number: {roll_number}\n"
+                + ("Assigned to the matching dashboard class." if linked_to_class else "Return to the class Students page to assign this student."),
                 parent=self.root,
             )
 

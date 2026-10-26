@@ -12,6 +12,7 @@ import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from contextlib import contextmanager
+from camera_utils import open_camera
 
 import cv2
 import numpy as np
@@ -86,10 +87,7 @@ def main(session_id: int, class_id: int) -> int:
 
     detector = cv2.FaceDetectorYN_create(str(DETECTOR_PATH), "", (320, 320), 0.8, 0.3, 5000)
     recognizer = cv2.FaceRecognizerSF_create(str(RECOGNIZER_PATH), "")
-    cap = cv2.VideoCapture(0)
-    if not cap.isOpened():
-        cap.release()
-        raise RuntimeError("Could not open webcam. Close other camera applications and try again.")
+    cap = open_camera(cv2)
 
     scheduled_end = datetime.strptime(f"{session_row['session_date']} {session_row['end_time']}", "%Y-%m-%d %H:%M")
     hard_deadline = scheduled_end + timedelta(minutes=GRACE_MINUTES)
@@ -150,7 +148,7 @@ def main(session_id: int, class_id: int) -> int:
                     cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
                     cv2.putText(frame, label[:70], (x, max(22, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
             with connect() as conn:
-                present_count = conn.execute("SELECT COUNT(*) FROM attendance_records WHERE session_id=? AND status='Present'", (session_id,)).fetchone()[0]
+                present_count = conn.execute("SELECT COUNT(*) FROM attendance_records WHERE session_id=? AND status IN ('Present','Late')", (session_id,)).fetchone()[0]
             remaining = max(0, int((hard_deadline - datetime.now()).total_seconds()))
             cv2.putText(frame, f"{session_row['class_code']} | {session_row['subject_name']} | Present: {present_count}/{len(allowed_rolls)}",
                         (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2)

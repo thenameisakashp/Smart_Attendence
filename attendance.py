@@ -5,6 +5,7 @@ import csv
 import sqlite3
 from datetime import datetime
 from pathlib import Path
+from camera_utils import open_camera
 
 # ---------------- CONFIGURATION ----------------
 BASE_DIR = Path(__file__).resolve().parent
@@ -232,9 +233,7 @@ def identify_face(frame, face, currently_active):
 
 
 # ---------------- WEBCAM LOOP ----------------
-cap = cv2.VideoCapture(0)
-if not cap.isOpened():
-    raise RuntimeError("Could not open webcam. Check camera permissions.")
+cap = open_camera(cv2)
 
 print("\nSmart Attendance System started.")
 print("Only active students can be marked present.")

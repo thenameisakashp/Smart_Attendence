@@ -7,21 +7,23 @@ This build keeps the original Python/Tkinter face-registration tool and OpenCV Y
 - HOD first-time setup and sign-in; passwords are hashed.
 - HOD-managed departments and classes.
 - Class-specific student membership. The dashboard opens the existing Tkinter Student Manager for face registration; it does not replace it with a web registration form.
-- Before the Tkinter Student Manager opens, web classes are synchronized into its legacy SQLite class selector so the selected class is identifiable there. After capturing a student's face, return to that class's Students page and assign the student to the class.
+- Before the Tkinter Student Manager opens, web classes are synchronized into its legacy SQLite class selector. A newly registered student is linked to the matching web class automatically when the mapping is available.
 - Subjects per class and lecturer account/subject assignments.
 - Lecturer access is restricted server-side to assigned classes and, when configured, assigned subjects.
 - CSV/XLSX timetable import with required-column, time, class matching, and overlap validation.
 - Scheduled attendance launch while the local Flask app is running. The scheduler checks every 15 seconds and catches up for timetable entries whose start time was within the last 30 minutes. It creates at most one session per timetable entry/date.
 - Class-scoped face recognition in `class_attendance_web.py`. It reads only the class's assigned student roster and the existing `dataset/face_features.json`; it writes records into SQLite and prevents duplicate attendance per student/session.
-- Class session reports derive absent/not-marked status from the class roster. The main dashboard can read both legacy daily CSV attendance and the new class/session records.
+- The dashboard shows each student's class/section, and includes a selected-date class/session breakdown with named Present, Absent, Excused, and Unmarked rosters. It reads legacy daily CSVs plus both desktop and web class-session databases.
+- Session reports let HODs and assigned lecturers review the full roster, record Present/Late/Absent/Excused statuses, correct face-recognition misses, and export a session CSV. Corrections are recorded in the audit log.
+- The dashboard attendance shortcut opens the original desktop class/subject window. Its SQLite attendance is included in the web dashboard's daily history; class workspaces continue to use class-scoped session reports.
 - Audit entries for key account, assignment, subject, timetable, and attendance actions.
 
 ## Important limits
 
-- The uploaded project did not include the YuNet/SFace ONNX model files. You must place both model files in `models/` before camera recognition/registration can run:
+- Face recognition needs the YuNet/SFace ONNX files in `models/` and an accessible webcam. The model files are present in this working copy:
   - `models/face_detection_yunet_2023mar.onnx`
   - `models/face_recognition_sface_2021dec.onnx`
-- A working webcam is required. Automatic attendance opens a camera window on the computer running `app.py`; the browser itself cannot remotely access that computer's camera through this design.
+- A working webcam is required. Registration and attendance now try camera indexes 0–3 with DirectShow and Media Foundation on Windows. If no device opens, check Windows Settings → Privacy & security → Camera and close other apps using it. Automatic attendance opens a camera window on the computer running `app.py`; the browser itself cannot remotely access that computer's camera through this design.
 - The timetable scheduler runs only while the local `app.py` process is running. Keep the computer awake and the app open during class times. If the camera is busy, a model is missing, or the process cannot start, check the terminal and session status.
 - The 30-minute window is a scheduler catch-up grace period and the attendance window stays open until the scheduled end plus 30 minutes. The user can finish early with **Q** or **Esc** in the camera window.
 - Glasses/cap/accessory detection is **not implemented** by YuNet/SFace alone. Do not treat these models as an accessory classifier.
@@ -55,7 +57,7 @@ This build keeps the original Python/Tkinter face-registration tool and OpenCV Y
 
 1. **Departments & classes:** Create the department, then create a class such as `CSE-4-A`.
 2. **Students:** Open the class, select **Students**, and use **Register student / capture face**. The existing Tkinter Student Manager opens on the same computer. Choose the matching mirrored class in its class selector and complete registration.
-3. Return to the class Students page, refresh, and assign the registered student to the web class. Repeat for the roster.
+3. Return to the class Students page and refresh. New students registered through the dashboard are assigned to the matching class automatically. Use **Assign student** for existing or unmapped records.
 4. **Subjects:** Create subjects in the class workspace, or import a timetable that creates/updates subjects.
 5. **Lecturers:** Create lecturer accounts and assign them to a class, optionally restricting them to one subject. Revoke an assignment to remove access.
 6. **Timetable:** Import CSV/XLSX using these headers exactly (case-insensitive):
@@ -65,8 +67,8 @@ This build keeps the original Python/Tkinter face-registration tool and OpenCV Y
    Example row: `Monday,21CS43,Data Structures,09:00,10:00,CSE-4-A,Room 101`
 
    The `section` value should match one class code (recommended) or an unambiguous section label. Overlaps for the same class/day are rejected.
-7. **Attendance:** Use the class's **Take attendance** page for a manual session, or leave `app.py` running for timetable-triggered sessions. The camera window shows recognition and present counts.
-8. **Reports:** Open the class attendance page and select a session report. Review all absences before treating them as official.
+7. **Attendance:** From the main dashboard, use **Open attendance window** to open the original desktop class/subject selector. For class-scoped web sessions and reports, open the class's **Take attendance** page. Timetable sessions launch while `app.py` is running. The camera computer needs a working webcam and Windows desktop camera permission.
+8. **Reports:** Open the class attendance page and select a session report. Save the final roster statuses (Present, Late, Absent, or Excused), then download the session CSV. Review absences before treating them as official.
 
 ## Existing desktop tools retained
 

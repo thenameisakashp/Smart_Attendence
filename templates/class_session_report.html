@@ -1,1 +1,63 @@
-<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Attendance Report</title><link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}"></head><body><div class="layout"><main class="main" style="margin-left:0;max-width:1200px;margin:auto"><header class="topbar"><div><div class="eyebrow">SESSION REPORT</div><h1>{{ session_row.class_code }} — {{ session_row.subject_name }}</h1><p>{{ session_row.session_date }} · {{ session_row.start_time }}–{{ session_row.end_time }} · {{ session_row.status }}</p></div><a class="button ghost" href="{{ url_for('class_attendance_page',class_id=session_row.class_id) }}">← Attendance</a></header><section class="panel"><div class="panel-head"><div><h3>Class roster status</h3><p>Students not marked present are shown as absent/not marked; review before official use.</p></div><span class="pill">{{ rows|length }} students</span></div><div class="table-wrap"><table><thead><tr><th>ROLL / USN</th><th>STUDENT</th><th>STATUS</th><th>MARKED AT</th></tr></thead><tbody>{% for r in rows %}<tr><td><code>{{ r.roll }}</code></td><td>{{ r.name }}</td><td><span class="status {{ 'present' if r.status=='Present' else 'absent' }}">{{ r.status }}</span></td><td>{{ r.time }}</td></tr>{% else %}<tr><td colspan="4" class="empty">No students assigned to this class.</td></tr>{% endfor %}</tbody></table></div></section></main></div></body></html>
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>{{ session_row.class_code }} attendance report | Smart Attendance</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+</head>
+<body>
+  <div class="layout">
+    <main class="main report-main">
+      <header class="topbar">
+        <div>
+          <div class="eyebrow">SESSION REPORT / {{ session_row.class_code }}</div>
+          <h1>{{ session_row.subject_name }}</h1>
+          <p>{{ session_row.session_date }} · {{ session_row.start_time }}–{{ session_row.end_time }} · {{ session_row.status|replace('_', ' ')|title }}</p>
+        </div>
+        <div class="top-actions">
+          <a class="button ghost" href="{{ url_for('class_attendance_page',class_id=session_row.class_id) }}">← Attendance</a>
+          <a class="button primary" href="{{ url_for('export_class_session_csv',class_id=session_row.class_id,session_id=session_row.id) }}">Download CSV</a>
+        </div>
+      </header>
+      {% with messages=get_flashed_messages(with_categories=true) %}
+        {% for category,message in messages %}<div class="flash {{ category }}">{{ message }}</div>{% endfor %}
+      {% endwith %}
+      <section class="panel">
+        <div class="panel-head">
+          <div><h3>Review and save roster</h3><p>Correct recognition misses and record absences or approved excuses. Every change is logged.</p></div>
+          <span class="pill">{{ rows|length }} students</span>
+        </div>
+        <form method="post" class="roster-form">
+          <div class="table-wrap">
+            <table>
+              <thead><tr><th>ROLL / USN</th><th>STUDENT</th><th>STATUS</th><th>LAST UPDATED</th></tr></thead>
+              <tbody>
+                {% for r in rows %}
+                <tr>
+                  <td><code>{{ r.roll }}</code></td>
+                  <td>{{ r.name }}</td>
+                  <td>
+                    <label class="sr-only" for="status-{{ loop.index }}">Attendance status for {{ r.name }}</label>
+                    <select class="status-select" id="status-{{ loop.index }}" name="status__{{ r.roll }}">
+                      {% for option in ['Present', 'Late', 'Absent', 'Excused'] %}
+                      <option value="{{ option }}" {% if r.status == option %}selected{% endif %}>{{ option }}</option>
+                      {% endfor %}
+                    </select>
+                  </td>
+                  <td>{{ r.time }}</td>
+                </tr>
+                {% else %}
+                <tr><td colspan="4" class="empty">No students are assigned to this class.</td></tr>
+                {% endfor %}
+              </tbody>
+            </table>
+          </div>
+          {% if rows %}<div class="roster-actions"><span class="muted">Saving updates the session report and its CSV export.</span><button class="button primary" type="submit">Save roster</button></div>{% endif %}
+        </form>
+      </section>
+      <footer>SMART ATTENDANCE <span>•</span> {{ session_row.class_code }} SESSION</footer>
+    </main>
+  </div>
+</body>
+</html>

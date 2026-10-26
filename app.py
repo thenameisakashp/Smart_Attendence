@@ -3,7 +3,7 @@ from pathlib import Path
 from datetime import datetime, date, timedelta
 from functools import wraps
 from contextlib import contextmanager
-import csv, json, io, os, sqlite3, subprocess, sys, calendar, secrets
+import csv, json, io, os, sqlite3, subprocess, sys, calendar, secrets, time
 from werkzeug.security import generate_password_hash, check_password_hash
 from collections import defaultdict
 
@@ -11,6 +11,7 @@ BASE_DIR = Path(__file__).resolve().parent
 FEATURES_FILE = BASE_DIR / "dataset" / "face_features.json"
 ATTENDANCE_DIR = BASE_DIR / "attendance_records"
 DASHBOARD_DB = BASE_DIR / "dataset" / "dashboard_admin.db"
+LEGACY_ATTENDANCE_DB = BASE_DIR / "dataset" / "smart_attendance.db"
 ATTENDANCE_DIR.mkdir(parents=True, exist_ok=True)
 DASHBOARD_DB.parent.mkdir(parents=True, exist_ok=True)
 
@@ -248,7 +249,7 @@ def attendance_file(day_text):
 
 
 def load_attendance(day_text):
-    """Merge legacy daily CSV rows with class/session attendance stored in SQLite."""
+    """Merge daily CSV rows and both desktop/web class-session databases."""
     records = {}
     path = attendance_file(day_text)
     if path.exists():
@@ -263,21 +264,152 @@ def load_attendance(day_text):
                         "name": (row.get("Name") or row.get("Student Name") or row.get("full_name") or "").strip(),
                         "time": (row.get("Time") or row.get("Timestamp") or row.get("time") or "").strip(),
                         "status": (row.get("Status") or row.get("status") or "Present").strip() or "Present",
+                        "class_name": (row.get("Class") or row.get("Section") or row.get("class_name") or "").strip(),
                     }
         except OSError:
             pass
+    if LEGACY_ATTENDANCE_DB.exists():
+        legacy = None
+        try:
+            legacy = sqlite3.connect(LEGACY_ATTENDANCE_DB, timeout=3)
+            legacy.row_factory = sqlite3.Row
+            legacy_rows = legacy.execute("""SELECT st.roll_number AS roll,st.full_name AS student_name,
+                sec.name AS class_name,r.status,r.marked_at FROM attendance_records r
+                JOIN attendance_sessions a ON a.id=r.session_id
+                JOIN students st ON st.id=r.student_id
+                JOIN sections sec ON sec.id=a.section_id
+                WHERE a.session_date=? ORDER BY r.marked_at""", (day_text,)).fetchall()
+            for row in legacy_rows:
+                records[row["roll"]] = {"roll": row["roll"], "name": row["student_name"],
+                                         "time": row["marked_at"], "status": row["status"],
+                                         "class_name": row["class_name"]}
+        except sqlite3.Error:
+            pass
+        finally:
+            if legacy is not None:
+                legacy.close()
     try:
         with db() as conn:
-            rows = conn.execute("""SELECT r.roll,r.student_name,r.status,r.marked_at
+            rows = conn.execute("""SELECT r.roll,r.student_name,r.status,r.marked_at,c.class_code AS class_name
                 FROM attendance_records r JOIN attendance_sessions a ON a.id=r.session_id
+                JOIN classes c ON c.id=a.class_id
                 WHERE a.session_date=? ORDER BY r.marked_at""", (day_text,)).fetchall()
         for row in rows:
             records[row["roll"]] = {"roll": row["roll"], "name": row["student_name"],
-                                    "time": row["marked_at"], "status": row["status"]}
+                                    "time": row["marked_at"], "status": row["status"],
+                                    "class_name": row["class_name"]}
     except sqlite3.Error:
         # Keep the dashboard usable if opened against an older database before migrations run.
         pass
     return records
+
+
+def student_class_labels():
+    """Return class labels for students so unmarked dashboard rows remain contextualized."""
+    labels = defaultdict(set)
+    try:
+        with db() as conn:
+            rows = conn.execute("""SELECT cs.roll,c.class_code FROM class_students cs
+                JOIN classes c ON c.id=cs.class_id""").fetchall()
+        for row in rows:
+            labels[row["roll"]].add(row["class_code"])
+    except sqlite3.Error:
+        pass
+    if LEGACY_ATTENDANCE_DB.exists():
+        legacy = None
+        try:
+            legacy = sqlite3.connect(LEGACY_ATTENDANCE_DB, timeout=3)
+            for roll, class_name in legacy.execute("""SELECT st.roll_number,sec.name
+                FROM students st JOIN sections sec ON sec.id=st.section_id"""):
+                if class_name:
+                    labels[str(roll)].add(str(class_name))
+        except sqlite3.Error:
+            pass
+        finally:
+            if legacy is not None:
+                legacy.close()
+    return {roll: ", ".join(sorted(names, key=str.casefold)) for roll, names in labels.items()}
+
+
+def class_attendance_summaries(day_text):
+    """Build a class/session roster summary with named present, absent, and excused students."""
+    students = load_students()
+    summaries = []
+
+    try:
+        with db() as conn:
+            sessions = conn.execute("""SELECT a.id,a.class_id,a.subject_id,a.session_date,a.start_time,a.end_time,
+                a.status,c.class_code,s.code AS subject_code,s.name AS subject_name
+                FROM attendance_sessions a JOIN classes c ON c.id=a.class_id
+                JOIN subjects s ON s.id=a.subject_id WHERE a.session_date=?
+                ORDER BY c.class_code,a.start_time,s.code""", (day_text,)).fetchall()
+            for session_row in sessions:
+                roster = conn.execute("SELECT roll FROM class_students WHERE class_id=? ORDER BY roll",
+                                      (session_row["class_id"],)).fetchall()
+                marks = {r["roll"]: r["status"] for r in conn.execute(
+                    "SELECT roll,status FROM attendance_records WHERE session_id=?", (session_row["id"],)
+                ).fetchall()}
+                present, absent, excused, unmarked = [], [], [], []
+                for item in roster:
+                    roll = item["roll"]
+                    name = students.get(roll, {}).get("name", roll)
+                    label = f"{name} ({roll})"
+                    recorded_status = marks.get(roll)
+                    if recorded_status is None and session_row["status"] != "completed":
+                        unmarked.append(label)
+                        continue
+                    status = (recorded_status or "Absent").casefold()
+                    if status in {"present", "late"}:
+                        present.append(label)
+                    elif status == "excused":
+                        excused.append(label)
+                    else:
+                        absent.append(label)
+                summaries.append({"class_name": session_row["class_code"],
+                    "subject": f"{session_row['subject_code']} — {session_row['subject_name']}",
+                    "time": f"{session_row['start_time']}–{session_row['end_time']}",
+                    "status": session_row["status"], "present": present, "absent": absent,
+                    "excused": excused, "unmarked": unmarked, "roster_count": len(roster), "source": "Class workspace"})
+    except sqlite3.Error:
+        pass
+
+    if LEGACY_ATTENDANCE_DB.exists():
+        legacy = None
+        try:
+            legacy = sqlite3.connect(LEGACY_ATTENDANCE_DB, timeout=3)
+            legacy.row_factory = sqlite3.Row
+            sessions = legacy.execute("""SELECT a.id,a.section_id,a.subject,a.start_time,a.end_time,a.status,
+                sec.name AS class_name FROM attendance_sessions a
+                JOIN sections sec ON sec.id=a.section_id WHERE a.session_date=?
+                ORDER BY sec.name,a.start_time,a.subject""", (day_text,)).fetchall()
+            for session_row in sessions:
+                roster = legacy.execute("SELECT roll_number,full_name FROM students WHERE section_id=? AND is_active=1 ORDER BY roll_number",
+                                        (session_row["section_id"],)).fetchall()
+                # Resolve recorded student IDs back to roll numbers for display.
+                student_ids = {r["roll_number"]: r["full_name"] for r in roster}
+                marked_rolls = {r["roll_number"] for r in legacy.execute(
+                    "SELECT st.roll_number FROM attendance_records ar JOIN students st ON st.id=ar.student_id "
+                    "WHERE ar.session_id=? AND lower(ar.status) IN ('present','late')",
+                    (session_row["id"],)).fetchall()}
+                present, absent, unmarked = [], [], []
+                for roll, name in student_ids.items():
+                    label = f"{name} ({roll})"
+                    if roll in marked_rolls:
+                        present.append(label)
+                    elif session_row["status"] == "completed":
+                        absent.append(label)
+                    else:
+                        unmarked.append(label)
+                summaries.append({"class_name": session_row["class_name"],
+                    "subject": session_row["subject"], "time": f"{session_row['start_time']}–{session_row['end_time']}",
+                    "status": session_row["status"], "present": present, "absent": absent,
+                    "excused": [], "unmarked": unmarked, "roster_count": len(roster), "source": "Desktop session"})
+        except sqlite3.Error:
+            pass
+        finally:
+            if legacy is not None:
+                legacy.close()
+    return summaries
 
 
 def all_days():
@@ -294,11 +426,23 @@ def all_days():
             days.extend(row[0] for row in conn.execute("SELECT DISTINCT session_date FROM attendance_sessions"))
     except sqlite3.Error:
         pass
+    if LEGACY_ATTENDANCE_DB.exists():
+        legacy = None
+        try:
+            legacy = sqlite3.connect(LEGACY_ATTENDANCE_DB, timeout=3)
+            days.extend(row[0] for row in legacy.execute("SELECT DISTINCT session_date FROM attendance_sessions"))
+        except sqlite3.Error:
+            pass
+        finally:
+            if legacy is not None:
+                legacy.close()
     return sorted(set(days))
 
 
-def dashboard_data(day_text, search=""):
+def dashboard_data(day_text, search="", classes_by_roll=None):
     students = load_students()
+    if classes_by_roll is None:
+        classes_by_roll = student_class_labels()
     attendance = load_attendance(day_text)
     complete = []
     for roll, student in students.items():
@@ -307,21 +451,23 @@ def dashboard_data(day_text, search=""):
             "roll": roll, "name": (rec.get("name") if rec and rec.get("name") else student["name"]),
             "time": rec["time"] if rec else "—",
             "status": rec["status"] if rec else ("Pending enrollment" if not student["enrolled"] else "Absent"),
+            "class_name": (rec.get("class_name") if rec else "") or classes_by_roll.get(roll, "—"),
             "enrolled": student["enrolled"],
         })
     for roll, rec in attendance.items():
         if roll not in students:
             complete.append({"roll": roll, "name": rec["name"] or "Unknown student", "time": rec["time"] or "—",
-                             "status": rec["status"], "enrolled": True})
+                             "status": rec["status"], "class_name": rec.get("class_name") or classes_by_roll.get(roll, "—"),
+                             "enrolled": True})
     complete.sort(key=lambda r: (r["status"].lower() != "present", r["name"].lower(), r["roll"]))
     rows = complete
     if search:
         n = search.casefold()
         rows = [r for r in complete if n in r["roll"].casefold() or n in r["name"].casefold()]
     enrolled = [s for s in students.values() if s["enrolled"]]
-    present = sum(1 for r in complete if r["status"].casefold() == "present")
+    present = sum(1 for r in complete if r["status"].casefold() in {"present", "late"})
     total = len(enrolled)
-    enrolled_present = sum(1 for r in complete if r["enrolled"] and r["status"].casefold() == "present")
+    enrolled_present = sum(1 for r in complete if r["enrolled"] and r["status"].casefold() in {"present", "late"})
     return {"rows": rows, "all_rows": complete, "total": total, "present": enrolled_present,
             "absent": max(total - enrolled_present, 0),
             "rate": round(enrolled_present / total * 100) if total else 0,
@@ -335,7 +481,7 @@ def student_attendance_stats(roll, days=30):
     records = []
     for d in day_list:
         rec = load_attendance(d.isoformat()).get(roll)
-        is_present = bool(rec and rec["status"].casefold() == "present")
+        is_present = bool(rec and rec["status"].casefold() in {"present", "late"})
         present_count += int(is_present)
         records.append({"date": d.isoformat(), "present": is_present,
                         "time": rec["time"] if rec else "—"})
@@ -467,6 +613,33 @@ def sync_web_classes_to_desktop_db():
                 conn.execute("INSERT OR REPLACE INTO web_class_sync(web_class_id,section_id) VALUES(?,?)", (cls["id"], section_id))
 
 
+def launch_desktop_script(script, *args, startup_wait=1.5):
+    """Start a desktop window in its own Windows console and retain startup errors."""
+    script = Path(script).resolve()
+    if not script.is_file():
+        raise FileNotFoundError(f"Desktop program was not found: {script.name}")
+    log_dir = BASE_DIR / "dataset" / "launch_logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    log_path = log_dir / f"{script.stem}_{stamp}.log"
+    creationflags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0) if os.name == "nt" else 0
+    with log_path.open("w", encoding="utf-8", errors="replace") as output:
+        process = subprocess.Popen(
+            [sys.executable, str(script), *map(str, args)],
+            cwd=str(BASE_DIR),
+            stdin=subprocess.DEVNULL,
+            stdout=output,
+            stderr=subprocess.STDOUT,
+            creationflags=creationflags,
+        )
+    time.sleep(startup_wait)
+    if process.poll() is not None:
+        details = log_path.read_text(encoding="utf-8", errors="replace")[-1800:].strip()
+        explanation = details or "The program closed during startup without reporting an error."
+        raise RuntimeError(f"{script.name} closed during startup (exit {process.returncode}). {explanation} Log: {log_path}")
+    return process.pid, log_path
+
+
 @app.post("/launch-student-manager")
 @role_required("hod")
 def launch_student_manager():
@@ -477,8 +650,8 @@ def launch_student_manager():
     else:
         try:
             sync_web_classes_to_desktop_db()
-            subprocess.Popen([sys.executable, str(script)], cwd=str(BASE_DIR))
-            flash("Student Manager opened. Web classes were synced into its class selector; register/capture the face, then assign the student to the class here.", "success")
+            process_id, _log_path = launch_desktop_script(script)
+            flash(f"Student Manager opened (process {process_id}). Web classes were synced into its class selector. After registration, refresh this page and assign the student to the class.", "success")
         except Exception as exc:
             flash(f"Could not open student_manager.py or sync class data: {exc}", "error")
     next_path = request.form.get("next", "").strip()
@@ -502,6 +675,7 @@ def index():
     data = dashboard_data(selected_date, search)
     return render_template("dashboard.html", data=data, selected_date=selected_date, search=search,
                            today=date.today().isoformat(), generated_at=datetime.now().strftime("%d %b %Y, %I:%M %p"),
+                           class_attendance=class_attendance_summaries(selected_date),
                            admin_user=session.get("username", "hod"), display_name=session.get("display_name", "HOD"))
 
 
@@ -511,7 +685,7 @@ def analytics_api():
     days = []
     for i in range(13, -1, -1):
         d = date.today() - timedelta(days=i)
-        info = dashboard_data(d.isoformat())
+        info = dashboard_data(d.isoformat(), classes_by_roll={})
         days.append({"date": d.strftime("%d %b"), "present": info["present"], "absent": info["absent"], "rate": info["rate"]})
     month_labels, month_values = [], []
     today = date.today()
@@ -526,7 +700,7 @@ def analytics_api():
         for d_text in all_days():
             d = datetime.strptime(d_text, "%Y-%m-%d").date()
             if d.year == year and d.month == month:
-                monthly_present += sum(1 for x in load_attendance(d_text).values() if x["status"].casefold() == "present")
+                monthly_present += sum(1 for x in load_attendance(d_text).values() if x["status"].casefold() in {"present", "late"})
         month_labels.append(label)
         month_values.append(monthly_present)
     return jsonify({"daily": days, "monthly_labels": month_labels, "monthly_present": month_values})
@@ -830,9 +1004,9 @@ def export_csv():
     data = dashboard_data(selected_date, request.args.get("q", "").strip())
     output = io.StringIO()
     writer = csv.writer(output)
-    writer.writerow(["Date", "Roll Number", "Student Name", "Time", "Status"])
+    writer.writerow(["Date", "Roll Number", "Student Name", "Class / Section", "Time", "Status"])
     for row in data["rows"]:
-        writer.writerow([selected_date, row["roll"], row["name"], row["time"], row["status"]])
+        writer.writerow([selected_date, row["roll"], row["name"], row["class_name"], row["time"], row["status"]])
     return Response("\\ufeff" + output.getvalue(), mimetype="text/csv",
                     headers={"Content-Disposition": f"attachment; filename=attendance_report_{selected_date}.csv"})
 
@@ -851,9 +1025,9 @@ def export_excel():
     wb = Workbook()
     ws = wb.active
     ws.title = "Attendance"
-    ws.append(["Date", "Roll Number", "Student Name", "Time", "Status"])
+    ws.append(["Date", "Roll Number", "Student Name", "Class / Section", "Time", "Status"])
     for row in data["rows"]:
-        ws.append([selected_date, row["roll"], row["name"], row["time"], row["status"]])
+        ws.append([selected_date, row["roll"], row["name"], row["class_name"], row["time"], row["status"]])
     for cell in ws[1]:
         cell.font = Font(bold=True, color="FFFFFF")
         cell.fill = PatternFill("solid", fgColor="263D63")
@@ -889,9 +1063,9 @@ def export_pdf():
     elements = [Paragraph("Smart Attendance Report", styles["Title"]),
                 Paragraph(f"Date: {selected_date} &nbsp;&nbsp; Present: {data['present']} &nbsp;&nbsp; Absent: {data['absent']} &nbsp;&nbsp; Rate: {data['rate']}%", styles["Normal"]),
                 Spacer(1, 14)]
-    table_data = [["Roll Number", "Student Name", "Time", "Status"]]
-    table_data += [[r["roll"], r["name"], r["time"], r["status"]] for r in data["rows"]]
-    table = Table(table_data, repeatRows=1, colWidths=[115, 270, 130, 120])
+    table_data = [["Roll Number", "Student Name", "Class / Section", "Time", "Status"]]
+    table_data += [[r["roll"], r["name"], r["class_name"], r["time"], r["status"]] for r in data["rows"]]
+    table = Table(table_data, repeatRows=1, colWidths=[90, 190, 170, 120, 90])
     table.setStyle(TableStyle([
         ("BACKGROUND", (0,0), (-1,0), colors.HexColor("#263D63")),
         ("TEXTCOLOR", (0,0), (-1,0), colors.white),
@@ -910,15 +1084,13 @@ def export_pdf():
 @app.post("/start-attendance")
 @role_required("hod")
 def start_attendance():
-    script = BASE_DIR / "attendance.py"
-    if not script.exists():
-        flash("attendance.py was not found. Copy this dashboard into your existing project root.", "error")
-    else:
-        try:
-            subprocess.Popen([sys.executable, str(script)], cwd=str(BASE_DIR))
-            flash("Attendance program launched. Refresh the dashboard after marking attendance.", "success")
-        except OSError as exc:
-            flash(f"Could not start attendance.py: {exc}", "error")
+    script = BASE_DIR / "class_attendance.py"
+    try:
+        sync_web_classes_to_desktop_db()
+        process_id, _log_path = launch_desktop_script(script)
+        flash(f"Class Attendance opened (process {process_id}). Choose the class and subject, then start the camera session.", "success")
+    except (OSError, RuntimeError, sqlite3.Error) as exc:
+        flash(f"Could not open Class Attendance: {exc}", "error")
     return redirect(url_for("index", date=request.form.get("date", date.today().isoformat())))
 
 
@@ -1181,8 +1353,10 @@ def launch_class_attendance(session_id, class_id):
     script = BASE_DIR / "class_attendance_web.py"
     if not script.is_file():
         raise FileNotFoundError("class_attendance_web.py is missing from the project folder.")
-    process = subprocess.Popen([sys.executable, str(script), "--session-id", str(session_id), "--class-id", str(class_id)], cwd=str(BASE_DIR))
-    return process.pid
+    process_id, _log_path = launch_desktop_script(
+        script, "--session-id", session_id, "--class-id", class_id, startup_wait=3.0
+    )
+    return process_id
 
 
 @app.route("/classes/<int:class_id>/attendance", methods=["GET", "POST"])
@@ -1219,7 +1393,7 @@ def class_attendance_page(class_id):
                 conn.execute("UPDATE attendance_sessions SET process_id=? WHERE id=?", (pid, session_id))
             audit("attendance_started_manually", "session", session_id, f"class={class_id}; subject={subject['name']}")
             flash(f"Attendance camera launched for {subject['name']}.", "success")
-        except (ValueError, OSError, sqlite3.Error) as exc:
+        except (ValueError, OSError, RuntimeError, sqlite3.Error) as exc:
             if session_id is not None:
                 with db() as conn:
                     conn.execute("UPDATE attendance_sessions SET status='failed',process_id=NULL WHERE id=? AND status='running'", (session_id,))
@@ -1227,7 +1401,7 @@ def class_attendance_page(class_id):
         return redirect(url_for("class_attendance_page", class_id=class_id))
     with db() as conn:
         sessions = conn.execute("""SELECT a.*,s.code AS subject_code,s.name AS subject_name,
-            (SELECT COUNT(*) FROM attendance_records r WHERE r.session_id=a.id AND r.status='Present') AS present_count
+            (SELECT COUNT(*) FROM attendance_records r WHERE r.session_id=a.id AND r.status IN ('Present','Late')) AS present_count
             FROM attendance_sessions a JOIN subjects s ON s.id=a.subject_id WHERE a.class_id=?
             ORDER BY a.session_date DESC,a.start_time DESC LIMIT 100""", (class_id,)).fetchall()
         if session.get("role") == "lecturer":
@@ -1238,9 +1412,13 @@ def class_attendance_page(class_id):
                            admin_user=session.get("username", "user"))
 
 
-@app.get("/classes/<int:class_id>/sessions/<int:session_id>")
+@app.route("/classes/<int:class_id>/sessions/<int:session_id>", methods=["GET", "POST"])
 @class_access_required
 def class_session_report(class_id, session_id):
+    students = load_students()
+    roster_size = 0
+    changed = 0
+    change_log = []
     with db() as conn:
         session_row = conn.execute("""SELECT a.*,c.class_code,s.code AS subject_code,s.name AS subject_name
             FROM attendance_sessions a JOIN classes c ON c.id=a.class_id JOIN subjects s ON s.id=a.subject_id
@@ -1254,16 +1432,74 @@ def class_session_report(class_id, session_id):
             if not allowed:
                 return render_template("forbidden.html"), 403
         assigned = {r[0] for r in conn.execute("SELECT roll FROM class_students WHERE class_id=?", (class_id,))}
-        students = load_students()
-        present = {r["roll"]: r for r in conn.execute("SELECT * FROM attendance_records WHERE session_id=?", (session_id,))}
-        rows = []
-        for roll in sorted(assigned):
-            student = students.get(roll, {"name": "Unknown", "enrolled": False})
-            record = present.get(roll)
-            rows.append({"roll": roll, "name": student["name"], "status": record["status"] if record else "Absent / not marked",
-                         "time": record["marked_at"] if record else "—"})
+        roster_size = len(assigned)
+        if request.method == "POST":
+            allowed_statuses = {"Present", "Late", "Absent", "Excused"}
+            submitted = {roll: request.form.get(f"status__{roll}", "") for roll in assigned}
+            invalid = [status for status in submitted.values() if status not in allowed_statuses]
+            if invalid:
+                flash("The attendance update included an invalid status. No changes were saved.", "error")
+                return redirect(url_for("class_session_report", class_id=class_id, session_id=session_id))
+            now = datetime.now().isoformat(timespec="seconds")
+            changed = 0
+            for roll, status in submitted.items():
+                existing = conn.execute("SELECT status FROM attendance_records WHERE session_id=? AND roll=?",
+                                        (session_id, roll)).fetchone()
+                if existing is None or existing["status"] != status:
+                    conn.execute("""INSERT INTO attendance_records(session_id,roll,student_name,status,marked_at)
+                        VALUES(?,?,?,?,?) ON CONFLICT(session_id,roll) DO UPDATE SET
+                        student_name=excluded.student_name,status=excluded.status,marked_at=excluded.marked_at""",
+                                 (session_id, roll, students.get(roll, {}).get("name", roll), status, now))
+                    changed += 1
+                    change_log.append(f"{roll}:{existing['status'] if existing else 'Unrecorded'}->{status}")
+        else:
+            present = {r["roll"]: r for r in conn.execute("SELECT * FROM attendance_records WHERE session_id=?", (session_id,))}
+            rows = []
+            for roll in sorted(assigned):
+                student = students.get(roll, {"name": "Unknown", "enrolled": False})
+                record = present.get(roll)
+                rows.append({"roll": roll, "name": student["name"], "status": record["status"] if record else "Absent",
+                             "time": record["marked_at"] if record else "—"})
+    if request.method == "POST":
+        audit("attendance_roster_corrected", "session", session_id,
+              f"class={class_id}; changed={changed}; roster_size={roster_size}; changes={','.join(change_log)}")
+        flash(f"Roster saved. {changed} attendance status{'es' if changed != 1 else ''} updated.", "success")
+        return redirect(url_for("class_session_report", class_id=class_id, session_id=session_id))
     return render_template("class_session_report.html", session_row=session_row, rows=rows,
                            admin_user=session.get("username", "user"))
+
+
+@app.get("/classes/<int:class_id>/sessions/<int:session_id>/export.csv")
+@class_access_required
+def export_class_session_csv(class_id, session_id):
+    with db() as conn:
+        session_row = conn.execute("""SELECT a.*,c.class_code,s.code AS subject_code,s.name AS subject_name
+            FROM attendance_sessions a JOIN classes c ON c.id=a.class_id JOIN subjects s ON s.id=a.subject_id
+            WHERE a.id=? AND a.class_id=?""", (session_id, class_id)).fetchone()
+        if not session_row:
+            flash("Session not found.", "error")
+            return redirect(url_for("class_attendance_page", class_id=class_id))
+        if session.get("role") == "lecturer":
+            allowed = conn.execute("SELECT 1 FROM lecturer_assignments WHERE user_id=? AND class_id=? AND (subject_id IS NULL OR subject_id=?) LIMIT 1",
+                                   (session["user_id"], class_id, session_row["subject_id"])).fetchone()
+            if not allowed:
+                return render_template("forbidden.html"), 403
+        assigned = [r[0] for r in conn.execute("SELECT roll FROM class_students WHERE class_id=? ORDER BY roll", (class_id,))]
+        records = {r["roll"]: r for r in conn.execute("SELECT roll,status,marked_at FROM attendance_records WHERE session_id=?", (session_id,))}
+    students = load_students()
+    output = io.StringIO(newline="")
+    writer = csv.writer(output)
+    writer.writerow(["Class", "Subject code", "Subject", "Session date", "Start time", "End time", "Roll number", "Student name", "Status", "Marked at"])
+    for roll in assigned:
+        student = students.get(roll, {"name": "Unknown"})
+        record = records.get(roll)
+        writer.writerow([session_row["class_code"], session_row["subject_code"], session_row["subject_name"],
+                         session_row["session_date"], session_row["start_time"], session_row["end_time"], roll,
+                         student["name"], record["status"] if record else "Absent / not marked",
+                         record["marked_at"] if record else ""])
+    filename = f"attendance_{session_row['class_code']}_{session_row['session_date']}_session-{session_id}.csv"
+    return Response("\ufeff" + output.getvalue(), mimetype="text/csv; charset=utf-8",
+                    headers={"Content-Disposition": f"attachment; filename={filename}"})
 
 
 def scheduler_tick(now=None):
