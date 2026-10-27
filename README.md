@@ -2,7 +2,7 @@
 
 This build keeps the original Python/Tkinter face-registration tool and OpenCV YuNet/SFace models, and connects them to a local Flask dashboard for departments, classes, class membership, subjects, lecturer access, timetable import, class attendance sessions, and reports.
 
-## What is connected
+## What is connected here
 
 - HOD first-time setup and sign-in; passwords are hashed.
 - HOD-managed departments and classes.
@@ -69,6 +69,12 @@ This build keeps the original Python/Tkinter face-registration tool and OpenCV Y
    The `section` value should match one class code (recommended) or an unambiguous section label. Overlaps for the same class/day are rejected.
 7. **Attendance:** From the main dashboard, use **Open attendance window** to open the original desktop class/subject selector. For class-scoped web sessions and reports, open the class's **Take attendance** page. Timetable sessions launch while `app.py` is running. The camera computer needs a working webcam and Windows desktop camera permission.
 8. **Reports:** Open the class attendance page and select a session report. Save the final roster statuses (Present, Late, Absent, or Excused), then download the session CSV. Review absences before treating them as official.
+
+## Camera liveness check
+
+Attendance camera flows use MediaPipe face landmarks for passive EAR blink, MAR mouth movement, face motion, image texture, and relative landmark z (pseudo-depth) signals. Before a student is marked, the camera asks for two blinks and one randomly selected action: open the mouth, turn toward a side of the camera image, or smile. The combined heuristic score is shown from 0 to 100; attendance requires the actions to pass and a score of at least 65.
+
+The Face Landmarker model is stored at `models/face_landmarker.task`. Install the runtime with `.venv\Scripts\python.exe -m pip install -r requirements.txt`. These RGB webcam checks raise the bar against static photos but do not guarantee protection against video replays or sophisticated spoofing.
 
 ## Existing desktop tools retained
 
