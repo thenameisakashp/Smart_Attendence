@@ -1,6 +1,6 @@
 import tkinter as tk
 from tkinter import ttk, messagebox
-import json
+import json, os
 import sqlite3
 import cv2
 import numpy as np
@@ -19,7 +19,9 @@ from database import (
 # ==================================================
 
 BASE_DIR = Path(__file__).resolve().parent
-DATASET_DIR = BASE_DIR / "dataset"
+DATASET_DIR = Path(os.environ.get("SMART_ATTENDANCE_DATA_DIR", BASE_DIR / "dataset")).expanduser()
+if not DATASET_DIR.is_absolute():
+    DATASET_DIR = (BASE_DIR / DATASET_DIR).resolve()
 FEATURES_FILE = DATASET_DIR / "face_features.json"
 DASHBOARD_DATABASE_FILE = DATASET_DIR / "dashboard_admin.db"
 
@@ -76,28 +78,49 @@ def save_face_database(data):
 
 
 def assign_registered_student_to_web_class(roll_number, section_id):
-    """Link a newly registered student to the web class mirrored into this section."""
+    """Link a registration to its same-branch web class, refusing cross-branch memberships."""
     if not DASHBOARD_DATABASE_FILE.exists():
-        return False
+        return "unavailable"
     connection = None
     try:
+        with get_connection() as registration_db:
+            student = registration_db.execute("""SELECT co.name AS branch
+                FROM students st JOIN sections sec ON sec.id=st.section_id
+                JOIN academic_levels al ON al.id=sec.academic_level_id
+                JOIN courses co ON co.id=al.course_id
+                WHERE st.roll_number=? AND st.section_id=? AND st.is_active=1""",
+                (roll_number, section_id)).fetchone()
+            mapping = registration_db.execute(
+                "SELECT web_class_id FROM web_class_sync WHERE section_id=?",
+                (section_id,),
+            ).fetchone()
+        if student is None or mapping is None:
+            return "unmapped"
+
         connection = sqlite3.connect(str(DASHBOARD_DATABASE_FILE), timeout=5)
         connection.execute("PRAGMA foreign_keys = ON")
-        mapping = connection.execute(
-            "SELECT web_class_id FROM web_class_sync WHERE section_id=?",
-            (section_id,),
+        web_class = connection.execute(
+            "SELECT department FROM classes WHERE id=?", (mapping[0],)
         ).fetchone()
-        if mapping is None:
-            return False
+        if web_class is None or str(web_class[0]).strip().casefold() != str(student["branch"]).strip().casefold():
+            return "branch_mismatch"
+
+        conflicting_branches = connection.execute("""SELECT DISTINCT c.department
+            FROM class_students cs JOIN classes c ON c.id=cs.class_id
+            WHERE cs.roll=?""", (roll_number,)).fetchall()
+        if any(str(row[0]).strip().casefold() != str(web_class[0]).strip().casefold()
+               for row in conflicting_branches):
+            return "branch_conflict"
+
         connection.execute(
             "INSERT OR IGNORE INTO class_students(class_id,roll,assigned_at) VALUES(?,?,?)",
             (mapping[0], roll_number, datetime.now().isoformat(timespec="seconds")),
         )
         connection.commit()
-        return True
+        return "assigned"
     except sqlite3.Error:
         # Registration remains successful if the dashboard database is unavailable.
-        return False
+        return "unavailable"
     finally:
         if connection is not None:
             connection.close()
@@ -202,6 +225,7 @@ def get_classes():
                 s.id AS section_id,
                 ec.name AS category,
                 c.name AS course,
+                s.name AS class_name,
                 al.name AS academic_level,
                 COALESCE(sem.name, 'No semester') AS semester,
                 s.name AS section
@@ -364,6 +388,7 @@ class StudentManager:
         self.root.configure(bg="#0f172a")
 
         self.class_lookup = {}
+        self.record_class_lookup = {}
 
         self.build_ui()
         self.refresh_classes()
@@ -393,7 +418,7 @@ class StudentManager:
         form = tk.Frame(self.root, bg="#1e293b")
         form.pack(fill="x", padx=25, pady=5)
 
-        labels = ["Roll Number", "Full Name", "Class / Section"]
+        labels = ["Roll Number", "Full Name", "Branch · Class · Semester"]
 
         for column, label in enumerate(labels):
             tk.Label(
@@ -495,6 +520,50 @@ class StudentManager:
             lambda event: self.refresh_students(),
         )
 
+        tk.Label(
+            filter_frame,
+            text="Branch:",
+            bg="#0f172a",
+            fg="white",
+        ).pack(side="left", padx=(18, 8))
+        self.branch_filter = ttk.Combobox(
+            filter_frame,
+            state="readonly",
+            values=("All Branches",),
+            width=18,
+        )
+        self.branch_filter.current(0)
+        self.branch_filter.pack(side="left")
+        self.branch_filter.bind(
+            "<<ComboboxSelected>>",
+            lambda event: self.update_record_class_filter(),
+        )
+
+        tk.Label(
+            filter_frame,
+            text="Class:",
+            bg="#0f172a",
+            fg="white",
+        ).pack(side="left", padx=(18, 8))
+        self.class_filter = ttk.Combobox(
+            filter_frame,
+            state="readonly",
+            values=("All Classes",),
+            width=28,
+        )
+        self.class_filter.current(0)
+        self.class_filter.pack(side="left")
+        self.class_filter.bind(
+            "<<ComboboxSelected>>",
+            lambda event: self.refresh_students(),
+        )
+
+        ttk.Button(
+            filter_frame,
+            text="Clear filters",
+            command=self.clear_record_filters,
+        ).pack(side="left", padx=(12, 0))
+
         table_frame = tk.Frame(self.root, bg="#1e293b")
         table_frame.pack(
             fill="both",
@@ -514,11 +583,9 @@ class StudentManager:
         columns = (
             "roll_number",
             "full_name",
-            "category",
-            "course",
-            "academic_level",
+            "branch",
+            "class_name",
             "semester",
-            "section",
             "status",
         )
 
@@ -532,22 +599,18 @@ class StudentManager:
         headings = {
             "roll_number": "Roll Number",
             "full_name": "Student Name",
-            "category": "Category",
-            "course": "Course",
-            "academic_level": "Year / Class",
+            "branch": "Branch",
+            "class_name": "Class / Section",
             "semester": "Semester",
-            "section": "Section",
             "status": "Status",
         }
 
         widths = {
             "roll_number": 100,
             "full_name": 150,
-            "category": 140,
-            "course": 125,
-            "academic_level": 110,
-            "semester": 90,
-            "section": 75,
+            "branch": 145,
+            "class_name": 160,
+            "semester": 105,
             "status": 90,
         }
 
@@ -604,9 +667,8 @@ class StudentManager:
 
             for row in classes:
                 label = (
-                    f"{row['category']} | {row['course']} | "
-                    f"{row['academic_level']} | {row['semester']} | "
-                    f"Section {row['section']}"
+                    f"Branch {row['course']} | Class {row['class_name']} | "
+                    f"{row['semester']}"
                 )
 
                 display_values.append(label)
@@ -614,10 +676,17 @@ class StudentManager:
 
             self.class_combo["values"] = display_values
 
+            branches = sorted({str(row["course"]) for row in classes}, key=str.casefold)
+            branch_values = ("All Branches", *branches)
+            self.branch_filter["values"] = branch_values
+            if self.branch_filter.get() not in branch_values:
+                self.branch_filter.current(0)
+            self.update_record_class_filter(classes, refresh=False)
+
             if display_values:
-                self.class_combo.current(0)
+                self.class_combo.set("")
                 self.status_label.config(
-                    text=f"{len(display_values)} class/section options loaded."
+                    text=f"{len(display_values)} class/section options loaded. Choose the student's branch and class before registering."
                 )
             else:
                 self.class_combo.set("")
@@ -631,6 +700,40 @@ class StudentManager:
                 str(error),
                 parent=self.root,
             )
+
+    def update_record_class_filter(self, classes=None, refresh=True):
+        """Update class choices according to the selected branch."""
+        try:
+            classes = classes if classes is not None else get_classes()
+            selected_branch = self.branch_filter.get()
+            choices = {}
+            for row in classes:
+                branch = str(row["course"])
+                if selected_branch != "All Branches" and branch.casefold() != selected_branch.casefold():
+                    continue
+                label = f"{row['class_name']} — {branch} — {row['semester']}"
+                choices[label] = (branch, str(row["class_name"]), str(row["semester"]))
+
+            self.record_class_lookup = choices
+            values = ("All Classes", *sorted(choices, key=str.casefold))
+            self.class_filter["values"] = values
+            if self.class_filter.get() not in values:
+                self.class_filter.current(0)
+            if refresh:
+                self.refresh_students()
+        except Exception as error:
+            messagebox.showerror(
+                "Class Filter Error",
+                str(error),
+                parent=self.root,
+            )
+
+    def clear_record_filters(self):
+        self.status_filter.current(0)
+        self.branch_filter.current(0)
+        self.update_record_class_filter(refresh=False)
+        self.class_filter.current(0)
+        self.refresh_students()
 
     # --------------------------------------------------
     # LOAD STUDENTS
@@ -648,6 +751,8 @@ class StudentManager:
                 st.full_name,
                 ec.name AS category,
                 c.name AS course,
+                c.name AS branch,
+                s.name AS class_name,
                 al.name AS academic_level,
                 COALESCE(sem.name, 'No semester') AS semester,
                 s.name AS section,
@@ -665,16 +770,35 @@ class StudentManager:
                 ON s.semester_id = sem.id
         """
 
+        conditions = []
+        params = []
         if selected_filter == "Active Students":
-            query += " WHERE st.is_active = 1"
+            conditions.append("st.is_active = 1")
         elif selected_filter == "Inactive Students":
-            query += " WHERE st.is_active = 0"
+            conditions.append("st.is_active = 0")
+
+        selected_branch = self.branch_filter.get()
+        if selected_branch and selected_branch != "All Branches":
+            conditions.append("upper(trim(c.name)) = upper(trim(?))")
+            params.append(selected_branch)
+
+        selected_class = self.record_class_lookup.get(self.class_filter.get())
+        if selected_class:
+            conditions.extend([
+                "upper(trim(c.name)) = upper(trim(?))",
+                "upper(trim(s.name)) = upper(trim(?))",
+                "upper(trim(COALESCE(sem.name, 'No semester'))) = upper(trim(?))",
+            ])
+            params.extend(selected_class)
+
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
 
         query += " ORDER BY st.full_name"
 
         try:
             with get_connection() as connection:
-                rows = connection.execute(query).fetchall()
+                rows = connection.execute(query, params).fetchall()
 
             for row in rows:
                 status = "Active" if row["is_active"] else "Inactive"
@@ -685,11 +809,9 @@ class StudentManager:
                     values=(
                         row["roll_number"],
                         row["full_name"],
-                        row["category"],
-                        row["course"],
-                        row["academic_level"],
+                        row["branch"],
+                        row["class_name"],
                         row["semester"],
-                        row["section"],
                         status,
                     ),
                 )
@@ -856,16 +978,24 @@ class StudentManager:
                     )
                 raise
 
-            linked_to_class = assign_registered_student_to_web_class(
+            link_status = assign_registered_student_to_web_class(
                 roll_number, section_id
             )
+
+            assignment_message = {
+                "assigned": "Assigned to the matching dashboard class.",
+                "branch_conflict": "Dashboard assignment was blocked because this student already has a class membership in another branch. Remove the conflicting membership before assigning them.",
+                "branch_mismatch": "Dashboard assignment was blocked because the selected registration branch does not match the mirrored class branch.",
+                "unmapped": "No matching dashboard class was found. Return to the class Students page to assign this student.",
+                "unavailable": "Student registration succeeded, but the dashboard could not be reached for automatic assignment.",
+            }.get(link_status, "Return to the class Students page to assign this student.")
 
             messagebox.showinfo(
                 "Success",
                 f"Student registered successfully!\n\n"
                 f"Name: {full_name}\n"
                 f"Roll Number: {roll_number}\n"
-                + ("Assigned to the matching dashboard class." if linked_to_class else "Return to the class Students page to assign this student."),
+                + assignment_message,
                 parent=self.root,
             )
 
@@ -901,7 +1031,7 @@ class StudentManager:
         values = self.tree.item(selected[0], "values")
         roll_number = values[0]
         student_name = values[1]
-        current_status = values[7]
+        current_status = values[5]
 
         if current_status == "Inactive":
             messagebox.showinfo(
@@ -975,7 +1105,7 @@ class StudentManager:
         values = self.tree.item(selected[0], "values")
         roll_number = values[0]
         student_name = values[1]
-        current_status = values[7]
+        current_status = values[5]
 
         if current_status == "Active":
             messagebox.showinfo(
@@ -1037,4 +1167,15 @@ class StudentManager:
 if __name__ == "__main__":
     root = tk.Tk()
     app = StudentManager(root)
+
+    def bring_student_manager_forward():
+        root.deiconify()
+        root.state("normal")
+        root.attributes("-topmost", True)
+        root.lift()
+        root.focus_force()
+        root.after(1800, lambda: root.attributes("-topmost", False))
+
+    root.after(150, bring_student_manager_forward)
+    print("Student Manager window ready.", flush=True)
     root.mainloop()

@@ -3,17 +3,22 @@ import numpy as np
 import json
 import csv
 import sqlite3
+import os
 from datetime import datetime
 from pathlib import Path
 from camera_utils import open_camera
+from liveness import LivenessChallenge
 
 # ---------------- CONFIGURATION ----------------
 BASE_DIR = Path(__file__).resolve().parent
+DATASET_DIR = Path(os.environ.get("SMART_ATTENDANCE_DATA_DIR", BASE_DIR / "dataset")).expanduser()
+if not DATASET_DIR.is_absolute():
+    DATASET_DIR = (BASE_DIR / DATASET_DIR).resolve()
 DETECTOR_MODEL = BASE_DIR / "models" / "face_detection_yunet_2023mar.onnx"
 RECOGNIZER_MODEL = BASE_DIR / "models" / "face_recognition_sface_2021dec.onnx"
-FEATURES_FILE = BASE_DIR / "dataset" / "face_features.json"
-DATABASE_FILE = BASE_DIR / "dataset" / "smart_attendance.db"
-ATTENDANCE_DIR = BASE_DIR / "attendance_records"
+FEATURES_FILE = DATASET_DIR / "face_features.json"
+DATABASE_FILE = DATASET_DIR / "smart_attendance.db"
+ATTENDANCE_DIR = DATASET_DIR / "attendance_records"
 
 # Starting values only; calibrate using genuine and non-matching test faces.
 RECOGNITION_THRESHOLD = 0.45
@@ -132,6 +137,7 @@ def load_marked_students():
     return marked
 
 marked_students = load_marked_students()
+liveness_checks = {}
 
 def mark_attendance(roll_no, student_name):
     """
@@ -275,9 +281,20 @@ try:
 
                 if roll_no is not None:
                     student_name = active_students[roll_no]["name"]
-                    attendance_status = mark_attendance(roll_no, student_name)
+                    if str(roll_no).strip().casefold() in marked_students:
+                        attendance_status = "already_marked"
+                        prompt = "Already marked"
+                    else:
+                        challenge = liveness_checks.setdefault(roll_no, LivenessChallenge())
+                        live, prompt = challenge.update(frame, face)
+                        attendance_status = (
+                            mark_attendance(roll_no, student_name) if live else "checking"
+                        )
 
-                    if attendance_status == "marked":
+                    if attendance_status == "checking":
+                        label = f"{student_name}: {prompt}"
+                        color = (0, 165, 255)
+                    elif attendance_status == "marked":
                         label = f"{student_name} - Attendance Marked"
                     elif attendance_status == "already_marked":
                         label = f"{student_name} - Already Marked"
@@ -286,9 +303,12 @@ try:
 
                     # Include the similarity score while keeping the status visible.
                     label = f"{label} ({score:.2f})"
-                    color = (0, 200, 0) if attendance_status in {
-                        "marked", "already_marked"
-                    } else (0, 0, 255)
+                    if attendance_status in {"marked", "already_marked"}:
+                        color = (0, 200, 0)
+                    elif attendance_status == "checking":
+                        color = (0, 165, 255)
+                    else:
+                        color = (0, 0, 255)
                 else:
                     score_text = f"{score:.2f}" if score >= 0 else "--"
                     label = f"{reason} ({score_text})"

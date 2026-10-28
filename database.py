@@ -1,10 +1,13 @@
 import sqlite3
+import os
 from pathlib import Path
 
 # Project paths
 
 BASE_DIR = Path(__file__).resolve().parent
-DATASET_DIR = BASE_DIR / "dataset"
+DATASET_DIR = Path(os.environ.get("SMART_ATTENDANCE_DATA_DIR", BASE_DIR / "dataset")).expanduser()
+if not DATASET_DIR.is_absolute():
+    DATASET_DIR = (BASE_DIR / DATASET_DIR).resolve()
 DATABASE_PATH = DATASET_DIR / "smart_attendance.db"
 
 def get_connection():

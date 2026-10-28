@@ -8,12 +8,15 @@ from werkzeug.security import generate_password_hash, check_password_hash
 from collections import defaultdict
 
 BASE_DIR = Path(__file__).resolve().parent
-FEATURES_FILE = BASE_DIR / "dataset" / "face_features.json"
-ATTENDANCE_DIR = BASE_DIR / "attendance_records"
-DASHBOARD_DB = BASE_DIR / "dataset" / "dashboard_admin.db"
-LEGACY_ATTENDANCE_DB = BASE_DIR / "dataset" / "smart_attendance.db"
+DATA_DIR = Path(os.environ.get("SMART_ATTENDANCE_DATA_DIR", BASE_DIR / "dataset")).expanduser()
+if not DATA_DIR.is_absolute():
+    DATA_DIR = (BASE_DIR / DATA_DIR).resolve()
+FEATURES_FILE = DATA_DIR / "face_features.json"
+ATTENDANCE_DIR = DATA_DIR / "attendance_records"
+DASHBOARD_DB = DATA_DIR / "dashboard_admin.db"
+LEGACY_ATTENDANCE_DB = DATA_DIR / "smart_attendance.db"
 ATTENDANCE_DIR.mkdir(parents=True, exist_ok=True)
-DASHBOARD_DB.parent.mkdir(parents=True, exist_ok=True)
+DATA_DIR.mkdir(parents=True, exist_ok=True)
 
 app = Flask(__name__)
 # Persist a randomly generated secret locally unless an environment secret is supplied.
@@ -56,6 +59,9 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE,
             password_hash TEXT NOT NULL, role TEXT NOT NULL CHECK(role IN ('hod','lecturer')),
             display_name TEXT NOT NULL, is_active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS institution_profile (
+            id INTEGER PRIMARY KEY CHECK(id=1), name TEXT NOT NULL, code TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL)""")
         # Step 1: class records. Subjects, lecturer assignments, and timetable are later steps.
         conn.execute("""CREATE TABLE IF NOT EXISTS classes (
@@ -120,6 +126,12 @@ def init_db():
             conn.execute("ALTER TABLE attendance_sessions ADD COLUMN process_id INTEGER")
         if "launch_attempts" not in session_columns:
             conn.execute("ALTER TABLE attendance_sessions ADD COLUMN launch_attempts INTEGER NOT NULL DEFAULT 0")
+        # Existing installations are assigned a neutral profile; first-time setup names the college.
+        has_profile = conn.execute("SELECT 1 FROM institution_profile WHERE id=1").fetchone()
+        has_user = conn.execute("SELECT 1 FROM users LIMIT 1").fetchone()
+        if not has_profile and has_user:
+            conn.execute("INSERT INTO institution_profile(id,name,code,created_at) VALUES(1,?,?,?)",
+                         ("Local College", "", datetime.now().isoformat(timespec="seconds")))
         # Seed common engineering departments once; the HOD can add others.
         department_count = conn.execute("SELECT COUNT(*) FROM departments").fetchone()[0]
         if department_count == 0:
@@ -158,6 +170,17 @@ def login_required(fn):
             return redirect(url_for("login"))
         return fn(*args, **kwargs)
     return wrapped
+
+
+@app.context_processor
+def institution_context():
+    """Make the single-college profile available to every template in this deployment."""
+    try:
+        with db() as conn:
+            profile = conn.execute("SELECT name,code FROM institution_profile WHERE id=1").fetchone()
+        return {"institution_name": profile["name"] if profile else "College not configured"}
+    except sqlite3.Error:
+        return {"institution_name": "College not configured"}
 
 
 def role_required(*roles):
@@ -238,6 +261,27 @@ def load_students():
     except sqlite3.Error:
         pass
     return students
+
+
+def registered_student_rolls_for_department(department):
+    """Return active student rolls registered in the selected engineering branch."""
+    if not LEGACY_ATTENDANCE_DB.exists():
+        return set()
+    legacy = None
+    try:
+        legacy = sqlite3.connect(LEGACY_ATTENDANCE_DB, timeout=3)
+        rows = legacy.execute("""SELECT st.roll_number
+            FROM students st
+            JOIN sections sec ON sec.id=st.section_id
+            JOIN academic_levels al ON al.id=sec.academic_level_id
+            JOIN courses co ON co.id=al.course_id
+            WHERE st.is_active=1 AND upper(trim(co.name))=upper(trim(?))""", (department,)).fetchall()
+        return {str(row[0]) for row in rows}
+    except sqlite3.Error:
+        return set()
+    finally:
+        if legacy is not None:
+            legacy.close()
 
 
 def attendance_file(day_text):
@@ -339,7 +383,7 @@ def class_attendance_summaries(day_text):
     try:
         with db() as conn:
             sessions = conn.execute("""SELECT a.id,a.class_id,a.subject_id,a.session_date,a.start_time,a.end_time,
-                a.status,c.class_code,s.code AS subject_code,s.name AS subject_name
+                a.status,c.class_code,c.department,s.code AS subject_code,s.name AS subject_name
                 FROM attendance_sessions a JOIN classes c ON c.id=a.class_id
                 JOIN subjects s ON s.id=a.subject_id WHERE a.session_date=?
                 ORDER BY c.class_code,a.start_time,s.code""", (day_text,)).fetchall()
@@ -365,7 +409,9 @@ def class_attendance_summaries(day_text):
                         excused.append(label)
                     else:
                         absent.append(label)
-                summaries.append({"class_name": session_row["class_code"],
+                summaries.append({"session_key": f"workspace:{session_row['id']}",
+                    "session_id": session_row["id"], "class_id": session_row["class_id"],
+                    "class_name": session_row["class_code"], "department": session_row["department"],
                     "subject": f"{session_row['subject_code']} — {session_row['subject_name']}",
                     "time": f"{session_row['start_time']}–{session_row['end_time']}",
                     "status": session_row["status"], "present": present, "absent": absent,
@@ -379,8 +425,10 @@ def class_attendance_summaries(day_text):
             legacy = sqlite3.connect(LEGACY_ATTENDANCE_DB, timeout=3)
             legacy.row_factory = sqlite3.Row
             sessions = legacy.execute("""SELECT a.id,a.section_id,a.subject,a.start_time,a.end_time,a.status,
-                sec.name AS class_name FROM attendance_sessions a
-                JOIN sections sec ON sec.id=a.section_id WHERE a.session_date=?
+                sec.name AS class_name,co.name AS department FROM attendance_sessions a
+                JOIN sections sec ON sec.id=a.section_id
+                JOIN academic_levels al ON al.id=sec.academic_level_id
+                JOIN courses co ON co.id=al.course_id WHERE a.session_date=?
                 ORDER BY sec.name,a.start_time,a.subject""", (day_text,)).fetchall()
             for session_row in sessions:
                 roster = legacy.execute("SELECT roll_number,full_name FROM students WHERE section_id=? AND is_active=1 ORDER BY roll_number",
@@ -400,7 +448,8 @@ def class_attendance_summaries(day_text):
                         absent.append(label)
                     else:
                         unmarked.append(label)
-                summaries.append({"class_name": session_row["class_name"],
+                summaries.append({"session_key": f"desktop:{session_row['id']}",
+                    "class_name": session_row["class_name"], "department": session_row["department"],
                     "subject": session_row["subject"], "time": f"{session_row['start_time']}–{session_row['end_time']}",
                     "status": session_row["status"], "present": present, "absent": absent,
                     "excused": [], "unmarked": unmarked, "roster_count": len(roster), "source": "Desktop session"})
@@ -439,11 +488,23 @@ def all_days():
     return sorted(set(days))
 
 
-def dashboard_data(day_text, search="", classes_by_roll=None):
+def dashboard_data(day_text, search="", classes_by_roll=None, branch="all", class_id=""):
     students = load_students()
     if classes_by_roll is None:
         classes_by_roll = student_class_labels()
     attendance = load_attendance(day_text)
+    memberships_by_roll = defaultdict(list)
+    try:
+        with db() as conn:
+            memberships = conn.execute("""SELECT cs.roll,c.id AS class_id,c.class_code,c.department
+                FROM class_students cs JOIN classes c ON c.id=cs.class_id""").fetchall()
+        for membership in memberships:
+            memberships_by_roll[membership["roll"]].append({
+                "id": str(membership["class_id"]), "department": str(membership["department"]),
+                "class_code": str(membership["class_code"]),
+            })
+    except sqlite3.Error:
+        pass
     complete = []
     for roll, student in students.items():
         rec = attendance.get(roll)
@@ -452,18 +513,24 @@ def dashboard_data(day_text, search="", classes_by_roll=None):
             "time": rec["time"] if rec else "—",
             "status": rec["status"] if rec else ("Pending enrollment" if not student["enrolled"] else "Absent"),
             "class_name": (rec.get("class_name") if rec else "") or classes_by_roll.get(roll, "—"),
+            "memberships": memberships_by_roll.get(roll, []),
             "enrolled": student["enrolled"],
         })
     for roll, rec in attendance.items():
         if roll not in students:
             complete.append({"roll": roll, "name": rec["name"] or "Unknown student", "time": rec["time"] or "—",
                              "status": rec["status"], "class_name": rec.get("class_name") or classes_by_roll.get(roll, "—"),
+                             "memberships": memberships_by_roll.get(roll, []),
                              "enrolled": True})
     complete.sort(key=lambda r: (r["status"].lower() != "present", r["name"].lower(), r["roll"]))
     rows = complete
     if search:
         n = search.casefold()
         rows = [r for r in complete if n in r["roll"].casefold() or n in r["name"].casefold()]
+    if branch != "all":
+        rows = [r for r in rows if any(m["department"].casefold() == branch.casefold() for m in r["memberships"])]
+    if class_id:
+        rows = [r for r in rows if any(m["id"] == str(class_id) for m in r["memberships"])]
     enrolled = [s for s in students.values() if s["enrolled"]]
     present = sum(1 for r in complete if r["status"].casefold() in {"present", "late"})
     total = len(enrolled)
@@ -497,20 +564,24 @@ def setup():
         return redirect(url_for("login"))
     error = None
     if request.method == "POST":
+        institution_name = request.form.get("institution_name", "").strip()
+        institution_code = request.form.get("institution_code", "").strip().upper()
         username = request.form.get("username", "").strip()
         display_name = request.form.get("display_name", "").strip()
         password = request.form.get("password", "")
         confirm = request.form.get("confirm_password", "")
-        if not username or not display_name:
-            error = "Enter your name and username."
-        elif len(username) > 80 or len(display_name) > 120:
-            error = "Name or username is too long."
+        if not institution_name or not username or not display_name:
+            error = "Enter the college name, your name, and a username."
+        elif len(institution_name) > 160 or len(institution_code) > 32 or len(username) > 80 or len(display_name) > 120:
+            error = "One or more fields are too long."
         elif len(password) < 12:
             error = "Use a password with at least 12 characters."
         elif password != confirm:
             error = "Passwords do not match."
         else:
             with db() as conn:
+                conn.execute("INSERT INTO institution_profile(id,name,code,created_at) VALUES(1,?,?,?)",
+                             (institution_name, institution_code, datetime.now().isoformat(timespec="seconds")))
                 conn.execute("INSERT INTO users(username,password_hash,role,display_name,created_at) VALUES(?,?,?,?,?)",
                              (username, generate_password_hash(password), "hod", display_name, datetime.now().isoformat(timespec="seconds")))
             flash("HOD account created. Sign in to continue.", "success")
@@ -618,14 +689,15 @@ def launch_desktop_script(script, *args, startup_wait=1.5):
     script = Path(script).resolve()
     if not script.is_file():
         raise FileNotFoundError(f"Desktop program was not found: {script.name}")
-    log_dir = BASE_DIR / "dataset" / "launch_logs"
+    log_dir = DATA_DIR / "launch_logs"
     log_dir.mkdir(parents=True, exist_ok=True)
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
     log_path = log_dir / f"{script.stem}_{stamp}.log"
+    executable = sys.executable
     creationflags = getattr(subprocess, "CREATE_NEW_CONSOLE", 0) if os.name == "nt" else 0
     with log_path.open("w", encoding="utf-8", errors="replace") as output:
         process = subprocess.Popen(
-            [sys.executable, str(script), *map(str, args)],
+            [executable, str(script), *map(str, args)],
             cwd=str(BASE_DIR),
             stdin=subprocess.DEVNULL,
             stdout=output,
@@ -672,10 +744,39 @@ def index():
     except ValueError:
         selected_date = date.today().isoformat()
     search = request.args.get("q", "").strip()
-    data = dashboard_data(selected_date, search)
+    selected_branch = request.args.get("branch", "all").strip()
+    selected_subject = request.args.get("subject", "").strip()
+    record_branch = request.args.get("record_branch", "all").strip()
+    record_class_id = request.args.get("record_class_id", "").strip()
+    with db() as conn:
+        departments = conn.execute("SELECT code,name FROM departments ORDER BY name COLLATE NOCASE").fetchall()
+        record_classes = conn.execute("SELECT id,class_code,department,semester,section FROM classes ORDER BY department,semester,section,class_code").fetchall()
+    valid_branch_codes = {row["code"].casefold() for row in departments}
+    if selected_branch.casefold() not in valid_branch_codes:
+        selected_branch = "all"
+    if record_branch.casefold() not in valid_branch_codes:
+        record_branch = "all"
+    if record_branch != "all":
+        record_classes = [item for item in record_classes if item["department"].casefold() == record_branch.casefold()]
+    if record_class_id not in {str(item["id"]) for item in record_classes}:
+        record_class_id = ""
+    data = dashboard_data(selected_date, search, branch=record_branch, class_id=record_class_id)
+    class_attendance = class_attendance_summaries(selected_date)
+    if selected_branch != "all":
+        selected_department = next(row for row in departments if row["code"].casefold() == selected_branch.casefold())
+        accepted_department_names = {selected_department["code"].casefold(), selected_department["name"].casefold()}
+        class_attendance = [item for item in class_attendance
+                            if (item.get("department") or "").strip().casefold() in accepted_department_names]
+    available_subjects = sorted({item["subject"] for item in class_attendance}, key=str.casefold)
+    if selected_subject not in available_subjects:
+        selected_subject = ""
+    if selected_subject:
+        class_attendance = [item for item in class_attendance if item["subject"] == selected_subject]
     return render_template("dashboard.html", data=data, selected_date=selected_date, search=search,
                            today=date.today().isoformat(), generated_at=datetime.now().strftime("%d %b %Y, %I:%M %p"),
-                           class_attendance=class_attendance_summaries(selected_date),
+                           class_attendance=class_attendance, departments=departments, selected_branch=selected_branch,
+                           available_subjects=available_subjects, selected_subject=selected_subject,
+                           record_classes=record_classes, record_branch=record_branch, record_class_id=record_class_id,
                            admin_user=session.get("username", "hod"), display_name=session.get("display_name", "HOD"))
 
 
@@ -846,17 +947,25 @@ def class_students(class_id):
         if not class_record:
             flash("Class not found.", "error")
             return redirect(url_for("department_management"))
+        eligible_rolls = registered_student_rolls_for_department(class_record["department"])
         if request.method == "POST":
             roll = request.form.get("roll", "").strip()
-            if roll not in all_students:
-                flash("Choose a student who exists in the student manager records.", "error")
+            if roll not in all_students or roll not in eligible_rolls:
+                flash("Choose a registered student from this class's branch.", "error")
             else:
-                try:
-                    conn.execute("INSERT INTO class_students(class_id, roll, assigned_at) VALUES(?,?,?)",
-                                 (class_id, roll, datetime.now().isoformat(timespec="seconds")))
-                    flash(f"{all_students[roll]['name']} assigned to {class_record['class_code']}.", "success")
-                except sqlite3.IntegrityError:
-                    flash("That student is already assigned to this class.", "error")
+                other_branches = conn.execute("""SELECT DISTINCT c.department
+                    FROM class_students cs JOIN classes c ON c.id=cs.class_id
+                    WHERE cs.roll=? AND cs.class_id<>?""", (roll, class_id)).fetchall()
+                if any(str(row["department"]).strip().casefold() !=
+                       str(class_record["department"]).strip().casefold() for row in other_branches):
+                    flash("This student is already assigned to a different branch. Remove that membership before assigning them here.", "error")
+                else:
+                    try:
+                        conn.execute("INSERT INTO class_students(class_id, roll, assigned_at) VALUES(?,?,?)",
+                                     (class_id, roll, datetime.now().isoformat(timespec="seconds")))
+                        flash(f"{all_students[roll]['name']} assigned to {class_record['class_code']}.", "success")
+                    except sqlite3.IntegrityError:
+                        flash("That student is already assigned to this class.", "error")
             return redirect(url_for("class_students", class_id=class_id))
         rows = conn.execute("SELECT roll, assigned_at FROM class_students WHERE class_id=? ORDER BY roll", (class_id,)).fetchall()
     assigned = []
@@ -864,6 +973,7 @@ def class_students(class_id):
         student = all_students.get(row["roll"], {"roll": row["roll"], "name": "Student record not found", "enrolled": False})
         assigned.append({**student, "assigned_at": row["assigned_at"]})
     unassigned = [student for roll, student in sorted(all_students.items(), key=lambda item: (item[1]["name"].casefold(), item[0]))
+                  if roll in eligible_rolls
                   if not any(s["roll"] == roll for s in assigned)]
     return render_template("class_students.html", class_record=class_record, students=assigned,
                            unassigned=unassigned, admin_user=session.get("username", "hod"),
@@ -897,12 +1007,24 @@ def edit_class(class_id):
             if semester < 1 or semester > 8:
                 raise ValueError
             with db() as conn:
-                result = conn.execute("UPDATE classes SET class_code=?, department=?, semester=?, section=?, academic_year=?, updated_at=? WHERE id=?",
-                                      (class_code, department, semester, section, academic_year, datetime.now().isoformat(timespec="seconds"), class_id))
-                if result.rowcount:
-                    flash(f"Class {class_code} updated.", "success")
-                else:
+                existing = conn.execute("SELECT department FROM classes WHERE id=?", (class_id,)).fetchone()
+                if not existing:
                     flash("Class not found.", "error")
+                elif existing["department"].strip().casefold() != department.casefold():
+                    assigned_rolls = [row[0] for row in conn.execute(
+                        "SELECT roll FROM class_students WHERE class_id=?", (class_id,)
+                    )]
+                    eligible_rolls = registered_student_rolls_for_department(department)
+                    if any(roll not in eligible_rolls for roll in assigned_rolls):
+                        flash("This class cannot move to another branch while it has students registered to a different branch. Remove or correct those class assignments first.", "error")
+                    else:
+                        conn.execute("UPDATE classes SET class_code=?, department=?, semester=?, section=?, academic_year=?, updated_at=? WHERE id=?",
+                                     (class_code, department, semester, section, academic_year, datetime.now().isoformat(timespec="seconds"), class_id))
+                        flash(f"Class {class_code} updated.", "success")
+                else:
+                    conn.execute("UPDATE classes SET class_code=?, department=?, semester=?, section=?, academic_year=?, updated_at=? WHERE id=?",
+                                 (class_code, department, semester, section, academic_year, datetime.now().isoformat(timespec="seconds"), class_id))
+                    flash(f"Class {class_code} updated.", "success")
         except ValueError:
             flash("Semester must be a number from 1 to 8.", "error")
         except sqlite3.IntegrityError:
@@ -922,8 +1044,66 @@ def delete_class(class_id):
 @app.get("/students")
 @role_required("hod")
 def students_page():
-    students = sorted(load_students().values(), key=lambda s: (s["name"].lower(), s["roll"]))
-    return render_template("students.html", students=students, admin_user=session.get("admin_user", "admin"))
+    with db() as conn:
+        departments = conn.execute("SELECT code,name FROM departments ORDER BY name COLLATE NOCASE").fetchall()
+        classes = conn.execute("SELECT id,class_code,department,semester,section FROM classes ORDER BY department,semester,section,class_code").fetchall()
+        memberships = conn.execute("""SELECT cs.roll,c.id AS class_id,c.class_code,c.department,c.semester
+            FROM class_students cs JOIN classes c ON c.id=cs.class_id
+            ORDER BY c.department,c.class_code""").fetchall()
+
+    selected_branch = request.args.get("branch", "all").strip()
+    department = next((d for d in departments if d["code"].casefold() == selected_branch.casefold()), None)
+    if not department:
+        selected_branch = "all"
+    selected_branch_name = department["name"] if department else ""
+    visible_classes = classes
+    if department:
+        branch_values = {department["code"].casefold(), department["name"].casefold()}
+        visible_classes = [c for c in classes if c["department"].strip().casefold() in branch_values]
+
+    loaded_students = load_students()
+    selected_semester = request.args.get("semester", "").strip()
+    if selected_semester not in {str(number) for number in range(1, 9)}:
+        selected_semester = ""
+    semester_counts = {str(number): set() for number in range(1, 9)}
+    for membership in memberships:
+        if membership["roll"] not in loaded_students:
+            continue
+        if department and membership["department"].strip().casefold() not in branch_values:
+            continue
+        semester_counts[str(membership["semester"])].add(membership["roll"])
+    if selected_semester:
+        visible_classes = [c for c in visible_classes if str(c["semester"]) == selected_semester]
+
+    selected_class_text = request.args.get("class_id", "").strip()
+    selected_class = next((c for c in visible_classes if str(c["id"]) == selected_class_text), None)
+    if not selected_class:
+        selected_class_text = ""
+
+    classes_by_roll = defaultdict(list)
+    for membership in memberships:
+        classes_by_roll[membership["roll"]].append({
+            "class_id": membership["class_id"], "class_code": membership["class_code"],
+            "department": membership["department"], "semester": membership["semester"],
+        })
+
+    students = []
+    for student in loaded_students.values():
+        student["memberships"] = classes_by_roll.get(student["roll"], [])
+        if selected_class and not any(m["class_id"] == selected_class["id"] for m in student["memberships"]):
+            continue
+        if selected_semester and not any(str(m["semester"]) == selected_semester for m in student["memberships"]):
+            continue
+        if department and not any(m["department"].strip().casefold() in branch_values for m in student["memberships"]):
+            continue
+        students.append(student)
+    students.sort(key=lambda s: (s["name"].casefold(), s["roll"]))
+    return render_template("students.html", students=students, departments=departments,
+                           visible_classes=visible_classes, selected_branch=selected_branch,
+                           selected_branch_name=selected_branch_name,
+                           selected_class_text=selected_class_text, selected_semester=selected_semester,
+                           semester_counts={key: len(value) for key, value in semester_counts.items()},
+                           admin_user=session.get("admin_user", "admin"))
 
 
 @app.post("/students/add")
@@ -1001,7 +1181,9 @@ def student_report(roll):
 @role_required("hod")
 def export_csv():
     selected_date = request.args.get("date", date.today().isoformat())
-    data = dashboard_data(selected_date, request.args.get("q", "").strip())
+    data = dashboard_data(selected_date, request.args.get("q", "").strip(),
+                          branch=request.args.get("record_branch", "all").strip(),
+                          class_id=request.args.get("record_class_id", "").strip())
     output = io.StringIO()
     writer = csv.writer(output)
     writer.writerow(["Date", "Roll Number", "Student Name", "Class / Section", "Time", "Status"])
@@ -1021,7 +1203,9 @@ def export_excel():
         flash("Excel export needs openpyxl. Run: python -m pip install openpyxl", "error")
         return redirect(url_for("index"))
     selected_date = request.args.get("date", date.today().isoformat())
-    data = dashboard_data(selected_date, request.args.get("q", "").strip())
+    data = dashboard_data(selected_date, request.args.get("q", "").strip(),
+                          branch=request.args.get("record_branch", "all").strip(),
+                          class_id=request.args.get("record_class_id", "").strip())
     wb = Workbook()
     ws = wb.active
     ws.title = "Attendance"
@@ -1056,7 +1240,9 @@ def export_pdf():
         flash("PDF export needs reportlab. Run: python -m pip install reportlab", "error")
         return redirect(url_for("index"))
     selected_date = request.args.get("date", date.today().isoformat())
-    data = dashboard_data(selected_date, request.args.get("q", "").strip())
+    data = dashboard_data(selected_date, request.args.get("q", "").strip(),
+                          branch=request.args.get("record_branch", "all").strip(),
+                          class_id=request.args.get("record_class_id", "").strip())
     out = io.BytesIO()
     doc = SimpleDocTemplate(out, pagesize=landscape(A4), rightMargin=28, leftMargin=28, topMargin=28, bottomMargin=28)
     styles = getSampleStyleSheet()

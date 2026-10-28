@@ -1,0 +1,13 @@
+Traceback (most recent call last):
+  File "C:\Users\pakas\Desktop\smart_attendance\student_manager.py", line 1038, in <module>
+    root = tk.Tk()
+  File "C:\Users\pakas\AppData\Local\Programs\Python\Python314\Lib\tkinter\__init__.py", line 2479, in __init__
+    self.tk = _tkinter.create(screenName, baseName, className, interactive, wantobjects, useTk, sync, use)
+              ~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+_tkinter.TclError: Can't find a usable init.tcl in the following directories: 
+    {C:\Users\pakas\AppData\Local\Programs\Python\Python314\tcl\tcl8.6}
+
+
+
+This probably means that Tcl wasn't installed properly.
+

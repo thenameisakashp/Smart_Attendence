@@ -13,6 +13,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from contextlib import contextmanager
 from camera_utils import open_camera
+from liveness import LivenessChallenge
 
 import cv2
 import numpy as np
@@ -104,6 +105,7 @@ def main(session_id: int, class_id: int) -> int:
     print(f"Session #{session_id}: {session_row['class_code']} / {session_row['subject_name']}")
     print(f"Assigned students with face features: {len(students)}. Press Q or ESC to finish.")
     seen_this_run = set()
+    liveness_checks = {}
     status_message = "Attendance running"
     try:
         while datetime.now() <= hard_deadline:
@@ -128,7 +130,14 @@ def main(session_id: int, class_id: int) -> int:
                                 best_roll, best_score = roll, float(score)
                         if best_roll is not None and best_score >= RECOGNITION_THRESHOLD:
                             record = students[best_roll]
-                            with connect() as conn:
+                            challenge = liveness_checks.setdefault(
+                                best_roll, LivenessChallenge()
+                            )
+                            live, prompt = challenge.update(frame, face)
+                            if not live:
+                                label, color = f"{record['name']}: {prompt}", (0, 165, 255)
+                            else:
+                              with connect() as conn:
                                 # Revalidate membership at marking time and enforce one record per session/roll.
                                 member = conn.execute("SELECT 1 FROM class_students WHERE class_id=? AND roll=?",
                                                       (class_id, best_roll)).fetchone()

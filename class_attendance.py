@@ -1,6 +1,7 @@
 import cv2
 import json
 import sqlite3
+import os
 import numpy as np
 import tkinter as tk
 
@@ -8,6 +9,7 @@ from tkinter import ttk, messagebox
 from pathlib import Path
 from datetime import datetime
 from camera_utils import open_camera
+from liveness import LivenessChallenge
 
 
 # =====================================================
@@ -15,9 +17,12 @@ from camera_utils import open_camera
 # =====================================================
 
 BASE_DIR = Path(__file__).resolve().parent
+DATASET_DIR = Path(os.environ.get("SMART_ATTENDANCE_DATA_DIR", BASE_DIR / "dataset")).expanduser()
+if not DATASET_DIR.is_absolute():
+    DATASET_DIR = (BASE_DIR / DATASET_DIR).resolve()
 
-DATABASE_FILE = BASE_DIR / "dataset" / "smart_attendance.db"
-FEATURES_FILE = BASE_DIR / "dataset" / "face_features.json"
+DATABASE_FILE = DATASET_DIR / "smart_attendance.db"
+FEATURES_FILE = DATASET_DIR / "face_features.json"
 
 DETECTOR_MODEL = (
     BASE_DIR / "models" / "face_detection_yunet_2023mar.onnx"
@@ -266,6 +271,7 @@ class ClassAttendanceApp:
         self.students_by_roll = {}
         self.features = {}
         self.marked_student_ids = set()
+        self.liveness_checks = {}
 
         self.setup_ui()
         self.load_classes()
@@ -669,12 +675,22 @@ class ClassAttendanceApp:
 
                     # Recheck current active status and section
                     # in the database before marking attendance.
-                    success_mark, result = mark_student_present(
-                        self.session_id,
-                        student_row["id"]
+                    challenge = self.liveness_checks.setdefault(
+                        best_roll, LivenessChallenge()
                     )
+                    live, prompt = challenge.update(frame, face)
 
-                    if success_mark:
+                    if live:
+                        success_mark, result = mark_student_present(
+                            self.session_id,
+                            student_row["id"]
+                        )
+                    else:
+                        success_mark, result = False, prompt
+                        label = f"{student_row['full_name']}: {prompt}"
+                        color = (0, 165, 255)
+
+                    if live and success_mark:
 
                         label = (
                             f"{student_row['full_name']} "
@@ -709,7 +725,7 @@ class ClassAttendanceApp:
                                 f"{student_row['full_name']}"
                             )
 
-                    else:
+                    elif live:
 
                         if result == "Attendance already marked.":
                             label = (
@@ -853,5 +869,16 @@ if __name__ == "__main__":
     root = tk.Tk()
 
     app = ClassAttendanceApp(root)
+
+    def bring_attendance_window_forward():
+        root.deiconify()
+        root.state("normal")
+        root.attributes("-topmost", True)
+        root.lift()
+        root.focus_force()
+        root.after(1800, lambda: root.attributes("-topmost", False))
+
+    root.after(150, bring_attendance_window_forward)
+    print("Class Attendance selector ready.", flush=True)
 
     root.mainloop()

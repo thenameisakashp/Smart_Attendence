@@ -5,6 +5,7 @@ import csv
 import sqlite3
 from datetime import datetime
 from pathlib import Path
+from liveness import LivenessChallenge
 
 # ---------------- CONFIGURATION ----------------
 BASE_DIR = Path(__file__).resolve().parent
@@ -131,6 +132,7 @@ def load_marked_students():
     return marked
 
 marked_students = load_marked_students()
+liveness_checks = {}
 
 def mark_attendance(roll_no, student_name):
     """Append attendance once per student per day."""
@@ -251,11 +253,21 @@ try:
 
                 if roll_no is not None:
                     student_name = active_students[roll_no]["name"]
-                    mark_attendance(roll_no, student_name)
-                    label = f"{student_name} ({roll_no}) {score:.2f}"
                     if roll_no.casefold() in marked_students:
-                        label += " - Present"
-                    color = (0, 200, 0)
+                        label = f"{student_name} ({roll_no}) - Present"
+                        color = (0, 200, 0)
+                    else:
+                        challenge = liveness_checks.setdefault(
+                            roll_no, LivenessChallenge()
+                        )
+                        live, prompt = challenge.update(frame, face)
+                        if live:
+                            mark_attendance(roll_no, student_name)
+                            label = f"{student_name} ({roll_no}) - Present"
+                            color = (0, 200, 0)
+                        else:
+                            label = f"{student_name}: {prompt}"
+                            color = (0, 165, 255)
                 else:
                     score_text = f"{score:.2f}" if score >= 0 else "--"
                     label = f"{reason} ({score_text})"
