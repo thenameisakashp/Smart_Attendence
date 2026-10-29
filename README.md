@@ -87,7 +87,7 @@ The Face Landmarker model is stored at `models/face_landmarker.task`. Install th
 - `database.py` — original desktop SQLite schema initializer.
 - `timetable_manager.py` — original local CSV/XLSX timetable JSON utility.
 
-## Data and backups
+## Data and backup
 
 Runtime databases and biometric data are created under `dataset/`; daily CSVs are stored in `attendance_records/`. These files are intentionally excluded from source-control defaults. Back up local data securely. Do not upload real student face embeddings, biometric samples, populated databases, or attendance files to a public repository.
 
