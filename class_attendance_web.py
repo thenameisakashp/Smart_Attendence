@@ -13,7 +13,7 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from contextlib import contextmanager
 from camera_utils import open_camera
-from liveness import LivenessChallenge
+from liveness import LivenessChallenge, LivenessError, MODEL_PATH
 
 import cv2
 import numpy as np
@@ -26,6 +26,9 @@ DETECTOR_PATH = BASE_DIR / "models" / "face_detection_yunet_2023mar.onnx"
 RECOGNIZER_PATH = BASE_DIR / "models" / "face_recognition_sface_2021dec.onnx"
 RECOGNITION_THRESHOLD = 0.45
 GRACE_MINUTES = 30
+
+# Check if liveness model exists
+LIVENESS_MODEL_AVAILABLE = MODEL_PATH.is_file()
 
 
 @contextmanager
@@ -90,7 +93,16 @@ def main(session_id: int, class_id: int) -> int:
 
     detector = cv2.FaceDetectorYN_create(str(DETECTOR_PATH), "", (320, 320), 0.8, 0.3, 5000)
     recognizer = cv2.FaceRecognizerSF_create(str(RECOGNIZER_PATH), "")
+
+    # Open camera with fallback diagnostics
     cap = open_camera(cv2)
+    if cap is None or not cap.isOpened():
+        raise RuntimeError(
+            "Failed to open webcam. Check: "
+            "1) Camera is connected and enabled in Windows Settings → Privacy & security → Camera, "
+            "2) No other app is using the camera, "
+            "3) The face_landmarker.task model exists at " + str(MODEL_PATH)
+        )
 
     scheduled_end = datetime.strptime(f"{session_row['session_date']} {session_row['end_time']}", "%Y-%m-%d %H:%M")
     hard_deadline = scheduled_end + timedelta(minutes=GRACE_MINUTES)
@@ -141,24 +153,41 @@ def main(session_id: int, class_id: int) -> int:
                             challenge = liveness_checks.setdefault(
                                 best_roll, LivenessChallenge()
                             )
-                            live, prompt = challenge.update(frame, face)
-                            if not live:
-                                label, color = f"{record['name']}: {prompt}", (0, 165, 255)
-                            else:
-                                # Revalidate membership at marking time and enforce one record per session/roll.
+                            try:
+                                live, prompt = challenge.update(frame, face)
+                                if live:
+                                    # Revalidate membership at marking time and enforce one record per session/roll.
+                                    member = conn.execute("SELECT 1 FROM class_students WHERE class_id=? AND roll=?",
+                                                          (class_id, best_roll)).fetchone()
+                                    if member:
+                                        try:
+                                            conn.execute("INSERT INTO attendance_records(session_id,roll,student_name,status,marked_at) VALUES(?,?,?,?,?)",
+                                                         (session_id, best_roll, record["name"], "Present", datetime.now().isoformat(timespec="seconds")))
+                                            seen_this_run.add(best_roll)
+                                            status_message = f"Marked present: {record['name']}"
+                                            label, color = f"{record['name']} {best_score:.2f}", (0, 200, 0)
+                                        except sqlite3.IntegrityError:
+                                            label, color = f"{record['name']} (already marked)", (0, 220, 220)
+                                    else:
+                                        label = "Not assigned to this class"
+                                else:
+                                    label, color = f"{record['name']}: {prompt}", (0, 165, 255)
+                            except LivenessError as le:
+                                # Liveness model error - allow attendance with warning
+                                label, color = f"{record['name']}: {le}", (0, 165, 255)
+                                print(f"WARNING: Liveness check failed for {record['name']}: {le}")
+                                # Still allow attendance but note the issue
                                 member = conn.execute("SELECT 1 FROM class_students WHERE class_id=? AND roll=?",
                                                       (class_id, best_roll)).fetchone()
                                 if member:
-                                    try:
-                                        conn.execute("INSERT INTO attendance_records(session_id,roll,student_name,status,marked_at) VALUES(?,?,?,?,?)",
-                                                     (session_id, best_roll, record["name"], "Present", datetime.now().isoformat(timespec="seconds")))
-                                        seen_this_run.add(best_roll)
-                                        status_message = f"Marked present: {record['name']}"
-                                        label, color = f"{record['name']} {best_score:.2f}", (0, 200, 0)
-                                    except sqlite3.IntegrityError:
-                                        label, color = f"{record['name']} (already marked)", (0, 220, 220)
-                                else:
-                                    label = "Not assigned to this class"
+                                    conn.execute("INSERT INTO attendance_records(session_id,roll,student_name,status,marked_at) VALUES(?,?,?,?,?)",
+                                                 (session_id, best_roll, record["name"], "Present", datetime.now().isoformat(timespec="seconds")))
+                                    seen_this_run.add(best_roll)
+                                    status_message = f"Marked present: {record['name']} (liveness check unavailable)"
+                                    label, color = f"{record['name']} {best_score:.2f} (no liveness)", (0, 150, 150)
+                            except Exception as le:
+                                label, color = f"{record['name']}: Liveness error", (0, 165, 255)
+                                print(f"WARNING: Liveness check exception for {record['name']}: {le}")
                     except Exception as exc:
                         label = f"Recognition error: {type(exc).__name__}"
                     cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)

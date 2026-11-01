@@ -17,8 +17,17 @@ from mediapipe.tasks.python import vision
 MODEL_PATH = Path(__file__).resolve().parent / "models" / "face_landmarker.task"
 
 
+class LivenessError(Exception):
+    """Raised when liveness verification fails due to configuration or runtime issues."""
+    pass
+
+
 class LivenessChallenge:
-    """Calculate a 0-100 passive/active score and require random actions."""
+    """Calculate a 0-100 passive/active score and require random actions.
+
+    Uses MediaPipe iris landmarks for enhanced anti-spoofing against
+    photos, videos, and display-based attacks.
+    """
 
     _landmarker = None
     _timestamp_ms = 0
@@ -39,6 +48,7 @@ class LivenessChallenge:
 
     @classmethod
     def _get_landmarker(cls):
+        """Get or create the MediaPipe FaceLandmarker singleton."""
         if cls._landmarker is None:
             if not MODEL_PATH.is_file():
                 raise FileNotFoundError(f"Face landmark model missing: {MODEL_PATH}")
@@ -57,6 +67,7 @@ class LivenessChallenge:
         self.reset()
 
     def reset(self):
+        """Reset challenge state for a new liveness session."""
         self.started = time.monotonic()
         self.phase = "baseline"
         self.baseline_ears = []
@@ -79,10 +90,12 @@ class LivenessChallenge:
         self.turn_direction = random.choice((-1, 1))
         self.gaze_target_x = random.uniform(0.3, 0.7)  # for gaze challenge
         self.passed = False
+        self.failed = False  # Track if we hit a fatal error
         self.score = 0
         self.passive_score = 0
         self.active_score = 0
         self.instruction = "Face the camera with eyes open"
+        self.error_message = ""
 
     @staticmethod
     def _distance(a, b):
@@ -90,19 +103,25 @@ class LivenessChallenge:
 
     @classmethod
     def _ear(cls, points, indices):
+        """Calculate Eye Aspect Ratio from landmark indices."""
         a, b, c, d, e, f = (points[index] for index in indices)
         vertical = cls._distance(b, f) + cls._distance(c, e)
         return vertical / max(2 * cls._distance(a, d), 1e-6)
 
     @classmethod
     def _mar(cls, points):
+        """Calculate Mouth Aspect Ratio."""
         width = cls._distance(points[cls._MOUTH_WIDTH[0]], points[cls._MOUTH_WIDTH[1]])
         vertical = sum(cls._distance(points[a], points[b]) for a, b in cls._MOUTH_VERTICALS)
         return vertical / max(3 * width, 1e-6)
 
     @staticmethod
     def _fit_ellipse_score(points, indices):
-        """Fit ellipse to iris points; return quality 0-100. High = good 3D iris structure."""
+        """Fit ellipse to iris points; return quality 0-100.
+
+        High score indicates good 3D iris structure (live eye).
+        Low score or 0 indicates flat/2D structure (possible photo/print).
+        """
         try:
             pts = np.array([(points[i].x, points[i].y) for i in indices], dtype=np.float32)
             if len(pts) < 4:
@@ -187,6 +206,7 @@ class LivenessChallenge:
             return 50.0
 
     def _update_passive_score(self, frame, face, points, mar):
+        """Update the passive liveness score using multiple biometric signals."""
         x, y, width, height = map(int, face[:4])
         fh, fw = frame.shape[:2]
         x0, y0, x1, y1 = max(0, x), max(0, y), min(fw, x + width), min(fh, y + height)
@@ -259,7 +279,16 @@ class LivenessChallenge:
         self.active_score = round(100 * self.action_index / len(self.actions))
 
     def update(self, frame, face):
-        """Return (passed, instruction); the current 0-100 score is .score."""
+        """Return (passed, instruction); the current 0-100 score is .score.
+
+        Args:
+            frame: The current camera frame (BGR image)
+            face: Tuple of (x, y, w, h) for the detected face
+
+        Returns:
+            Tuple of (passed: bool, instruction: str)
+            If passed is True, attendance should be recorded
+        """
         if self.passed:
             return True, f"Live check passed ({self.score}/100)"
         if time.monotonic() - self.started > self.timeout_seconds:
@@ -270,7 +299,7 @@ class LivenessChallenge:
             fh, fw = frame.shape[:2]
             x0, y0, x1, y1 = max(0, x), max(0, y), min(fw, x + width), min(fh, y + height)
             if x1 <= x0 or y1 <= y0:
-                return False, "Center your face"
+                return False, "Center your face in the camera"
             rgb = cv2.cvtColor(frame[y0:y1, x0:x1], cv2.COLOR_BGR2RGB)
             image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
             cls = type(self)
@@ -295,8 +324,14 @@ class LivenessChallenge:
             eye_width = self._distance(points[self._EYE_CORNERS[0]], points[self._EYE_CORNERS[1]])
             yaw = (points[self._NOSE].x - eye_mid_x) / max(eye_width, 1e-6)
             self._update_passive_score(frame, face, points, mar)
-        except (ValueError, IndexError, cv2.error):
-            return False, "Center your face; keep eyes visible"
+        except Exception as e:
+            # Graceful fallback for frame/landmark errors
+            error_msg = str(e) if str(e) else "unknown error"
+            if "model" in error_msg.lower() or "landmarker" in error_msg.lower():
+                self.failed = True
+                self.error_message = f"Face detection model error: {error_msg}"
+                raise LivenessError(self.error_message) from e
+            return False, f"Face detection error: {error_msg}. Try moving the camera."
 
         previous_blinks = self.blinks
         if both_open:
