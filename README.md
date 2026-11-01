@@ -72,9 +72,25 @@ This build keeps the original Python/Tkinter face-registration tool and OpenCV Y
 
 ## Camera liveness check
 
-Attendance camera flows use MediaPipe face landmarks for passive EAR blink, MAR mouth movement, face motion, image texture, and relative landmark z (pseudo-depth) signals. Before a student is marked, the camera asks for two blinks and one randomly selected action: open the mouth, turn toward a side of the camera image, or smile. The combined heuristic score is shown from 0 to 100; attendance requires the actions to pass and a score of at least 65.
+Attendance camera flows use MediaPipe Face Landmarker with iris landmarks for passive and active liveness verification. Before a student is marked, the camera asks for two blinks and one randomly selected action (open mouth, turn head, smile, or look at screen center). The combined heuristic score is shown from 0 to 100; attendance requires a score of at least 65.
 
-The Face Landmarker model is stored at `models/face_landmarker.task`. Install the runtime with `.venv\Scripts\python.exe -m pip install -r requirements.txt`. These RGB webcam checks raise the bar against static photos but do not guarantee protection against video replays or sophisticated spoofing.
+### Anti-spoof signals
+
+**Passive signals (continuous):**
+- EAR: eye aspect ratio for blink detection
+- MAR: mouth aspect ratio for mouth activity
+- Motion: face centroid movement in frame
+- Texture: Laplacian variance for image quality
+- Pseudo-depth: z-coordinate span of facial landmarks
+- **Iris ellipse quality**: 3D iris structure verification via fitted ellipse residuals
+- **Gaze direction**: pupil position relative to eye corners
+- **Pupil micro-movement**: physiological jitter tracking
+
+**Active challenges:**
+- Two confirmed blinks
+- One of: mouth open, head turn (left/right), smile, gaze at center
+
+The Face Landmarker model is stored at `models/face_landmarker.task`. Install the runtime with `.venv\Scripts\python.exe -m pip install -r requirements.txt`. These RGB webcam checks raise the bar against static photos and printed attacks but do not guarantee protection against display-based video replays or sophisticated spoofing.
 
 ## Existing desktop tools retained
 

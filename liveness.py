@@ -10,6 +10,7 @@ import time
 
 import cv2
 import mediapipe as mp
+import numpy as np
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 
@@ -28,6 +29,14 @@ class LivenessChallenge:
     _NOSE = 1
     _EYE_CORNERS = (33, 263)
 
+    # Iris landmark indices (MediaPipe FaceLandmarker with output_iris=True)
+    # 468-471: left iris perimeter, 472-475: right iris perimeter
+    # 476: left pupil center, 477: right pupil center
+    _IRIS_LEFT = (468, 469, 470, 471)
+    _IRIS_RIGHT = (472, 473, 474, 475)
+    _PUPIL_LEFT = 476
+    _PUPIL_RIGHT = 477
+
     @classmethod
     def _get_landmarker(cls):
         if cls._landmarker is None:
@@ -38,6 +47,7 @@ class LivenessChallenge:
                 running_mode=vision.RunningMode.VIDEO,
                 num_faces=1,
                 output_face_blendshapes=False,
+                output_iris=True,
             )
             cls._landmarker = vision.FaceLandmarker.create_from_options(options)
         return cls._landmarker
@@ -61,11 +71,13 @@ class LivenessChallenge:
         self.texture_scores = deque(maxlen=24)
         self.depth_scores = deque(maxlen=24)
         self.mouth_samples = deque(maxlen=24)
-        self.actions = ["blink", random.choice(("mouth", "turn", "smile"))]
+        self.pupil_positions = deque(maxlen=24)
+        self.actions = ["blink", random.choice(("mouth", "turn", "smile", "gaze"))]
         random.shuffle(self.actions)
         self.action_index = 0
         self.action_streak = 0
         self.turn_direction = random.choice((-1, 1))
+        self.gaze_target_x = random.uniform(0.3, 0.7)  # for gaze challenge
         self.passed = False
         self.score = 0
         self.passive_score = 0
@@ -87,6 +99,92 @@ class LivenessChallenge:
         width = cls._distance(points[cls._MOUTH_WIDTH[0]], points[cls._MOUTH_WIDTH[1]])
         vertical = sum(cls._distance(points[a], points[b]) for a, b in cls._MOUTH_VERTICALS)
         return vertical / max(3 * width, 1e-6)
+
+    @staticmethod
+    def _fit_ellipse_score(points, indices):
+        """Fit ellipse to iris points; return quality 0-100. High = good 3D iris structure."""
+        try:
+            pts = np.array([(points[i].x, points[i].y) for i in indices], dtype=np.float32)
+            if len(pts) < 4:
+                return 0.0
+            ellipse = cv2.fitEllipse(pts)
+            (cx, cy), (ma, ma), angle = ellipse
+            # Check: reasonable aspect ratio (not collapsed), reasonable size
+            if ma < 0.008 or ma > 0.06:  # iris too small/large in normalized coords
+                return 0.0
+            aspect = min(ma, ma) / max(ma, ma, 1e-6)
+            if aspect < 0.5:  # too elliptical = likely 2D print
+                return 0.0
+            # Residuals - how well points fit ellipse
+            residuals = []
+            for (x, y) in pts:
+                dx, dy = x - cx, y - cy
+                cos_a, sin_a = np.cos(angle), np.sin(angle)
+                x_rot = dx * cos_a + dy * sin_a
+                y_rot = -dx * sin_a + dy * cos_a
+                residual = (x_rot / (ma / 2)) ** 2 + (y_rot / (ma / 2)) ** 2 - 1
+                residuals.append(abs(residual))
+            fit_quality = max(0.0, 100.0 - np.mean(residuals) * 500.0)
+            return min(100.0, fit_quality)
+        except (cv2.error, ValueError, ZeroDivisionError):
+            return 0.0
+
+    def _gaze_score(self, points):
+        """Check if user is looking at camera (pupil centered in eye). Return 0-100."""
+        try:
+            # Eye corners: 33 (right inner), 133 (right outer), 263 (left inner), 362 (left outer)
+            # Pupil centers: 476 (left), 477 (right)
+            left_pupil = points[self._PUPIL_LEFT]
+            right_pupil = points[self._PUPIL_RIGHT]
+            left_inner, left_outer = points[362], points[263]
+            right_inner, right_outer = points[133], points[33]
+
+            # Horizontal gaze: pupil position relative to eye corners
+            left_eye_width = self._distance(left_inner, left_outer)
+            right_eye_width = self._distance(right_inner, right_outer)
+            if left_eye_width < 1e-6 or right_eye_width < 1e-6:
+                return 0.0
+
+            left_gaze = (left_pupil.x - left_inner.x) / left_eye_width
+            right_gaze = (right_outer.x - right_pupil.x) / right_eye_width
+
+            # Centered gaze ≈ 0.5; looking away deviates
+            left_centered = 1.0 - abs(left_gaze - 0.5) * 2
+            right_centered = 1.0 - abs(right_gaze - 0.5) * 2
+            gaze_centered = (left_centered + right_centered) / 2
+
+            return max(0.0, min(100.0, gaze_centered * 100.0))
+        except (ValueError, IndexError, ZeroDivisionError):
+            return 0.0
+
+    def _pupil_stability(self, points):
+        """Track pupil center micro-movements. Live eyes have physiological micro-jitter."""
+        try:
+            left_pupil = points[self._PUPIL_LEFT]
+            right_pupil = points[self._PUPIL_RIGHT]
+            center_x = (left_pupil.x + right_pupil.x) / 2
+            center_y = (left_pupil.y + right_pupil.y) / 2
+
+            self.pupil_positions.append((center_x, center_y))
+            if len(self.pupil_positions) < 8:
+                return 50.0  # neutral until we have history
+
+            # Compute micro-movement variance (live eyes have small but consistent movement)
+            xs = [p[0] for p in self.pupil_positions]
+            ys = [p[1] for p in self.pupil_positions]
+            var_x = np.var(xs)
+            var_y = np.var(ys)
+            total_var = var_x + var_y
+
+            # Too static = photo/video; too much = tracking noise
+            # Sweet spot for live: 1e-7 to 1e-5 range in normalized coords
+            if total_var < 1e-7:
+                return 20.0  # too static
+            if total_var > 5e-5:
+                return 30.0  # too noisy
+            return min(100.0, total_var * 2e6)  # scale to 0-100
+        except (ValueError, IndexError):
+            return 50.0
 
     def _update_passive_score(self, frame, face, points, mar):
         x, y, width, height = map(int, face[:4])
@@ -114,6 +212,14 @@ class LivenessChallenge:
             movement = 0.0
         motion_score = max(0.0, min(100.0, movement * 1200.0))
 
+        # Iris-based signals
+        left_iris_score = self._fit_ellipse_score(points, self._IRIS_LEFT)
+        right_iris_score = self._fit_ellipse_score(points, self._IRIS_RIGHT)
+        iris_score = (left_iris_score + right_iris_score) / 2
+
+        gaze_score = self._gaze_score(points)
+        pupil_stability = self._pupil_stability(points)
+
         self.texture_scores.append(texture)
         self.depth_scores.append(pseudo_depth)
         self.mouth_samples.append(mar)
@@ -123,8 +229,9 @@ class LivenessChallenge:
         mouth_activity = max(self.mouth_samples) - min(self.mouth_samples)
         mouth_score = max(0.0, min(100.0, mouth_activity * 500.0))
         self.passive_score = round(
-            0.30 * blink_score + 0.10 * mouth_score + 0.20 * motion_score
-            + 0.18 * texture_score + 0.22 * depth_score
+            0.20 * blink_score + 0.08 * mouth_score + 0.15 * motion_score
+            + 0.15 * texture_score + 0.15 * depth_score
+            + 0.12 * iris_score + 0.10 * gaze_score + 0.05 * pupil_stability
         )
 
     def _current_action(self):
@@ -141,6 +248,8 @@ class LivenessChallenge:
             return f"Turn toward the {side} side of the image"
         if action == "smile":
             return "Smile"
+        if action == "gaze":
+            return "Look at the center of the screen"
         return "Checking live signals"
 
     def _complete_action(self):
@@ -232,6 +341,10 @@ class LivenessChallenge:
             self.action_streak = self.action_streak + 1 if turned else 0
         elif action == "smile":
             self.action_streak = self.action_streak + 1 if smile else 0
+        elif action == "gaze":
+            # Gaze challenge: user should look at center (gaze_score > 70)
+            gaze_score = self._gaze_score(points)
+            self.action_streak = self.action_streak + 1 if gaze_score > 70 else 0
 
         if self.action_streak >= (2 if action == "blink" else 3):
             self._complete_action()
