@@ -35,6 +35,8 @@ def connect():
     conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
     try:
         yield conn
         conn.commit()
@@ -107,6 +109,12 @@ def main(session_id: int, class_id: int) -> int:
     seen_this_run = set()
     liveness_checks = {}
     status_message = "Attendance running"
+    # One connection for the whole session. Opening a fresh connection per face
+    # (and per frame) is wasteful and, under WAL contention with the web
+    # process, invites lock timeouts and duplicate work.
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys=ON")
     try:
         while datetime.now() <= hard_deadline:
             ok, frame = cap.read()
@@ -137,7 +145,6 @@ def main(session_id: int, class_id: int) -> int:
                             if not live:
                                 label, color = f"{record['name']}: {prompt}", (0, 165, 255)
                             else:
-                              with connect() as conn:
                                 # Revalidate membership at marking time and enforce one record per session/roll.
                                 member = conn.execute("SELECT 1 FROM class_students WHERE class_id=? AND roll=?",
                                                       (class_id, best_roll)).fetchone()
@@ -156,8 +163,7 @@ def main(session_id: int, class_id: int) -> int:
                         label = f"Recognition error: {type(exc).__name__}"
                     cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
                     cv2.putText(frame, label[:70], (x, max(22, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
-            with connect() as conn:
-                present_count = conn.execute("SELECT COUNT(*) FROM attendance_records WHERE session_id=? AND status IN ('Present','Late')", (session_id,)).fetchone()[0]
+            present_count = conn.execute("SELECT COUNT(*) FROM attendance_records WHERE session_id=? AND status IN ('Present','Late')", (session_id,)).fetchone()[0]
             remaining = max(0, int((hard_deadline - datetime.now()).total_seconds()))
             cv2.putText(frame, f"{session_row['class_code']} | {session_row['subject_name']} | Present: {present_count}/{len(allowed_rolls)}",
                         (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2)
@@ -168,6 +174,8 @@ def main(session_id: int, class_id: int) -> int:
             if key in (ord('q'), 27):
                 break
     finally:
+        conn.commit()
+        conn.close()
         cap.release()
         cv2.destroyAllWindows()
         finish_session(session_id)

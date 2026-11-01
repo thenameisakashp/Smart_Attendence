@@ -9,6 +9,8 @@ from collections import defaultdict
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("SMART_ATTENDANCE_DATA_DIR", BASE_DIR / "dataset")).expanduser()
+# Scheduler catch-up grace period; must match the window used by class_attendance_web.py.
+GRACE_MINUTES = 30
 if not DATA_DIR.is_absolute():
     DATA_DIR = (BASE_DIR / DATA_DIR).resolve()
 FEATURES_FILE = DATA_DIR / "face_features.json"
@@ -38,6 +40,8 @@ def db():
     conn = sqlite3.connect(DASHBOARD_DB, timeout=10)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA busy_timeout = 5000")
     try:
         yield conn
         conn.commit()
@@ -684,8 +688,15 @@ def sync_web_classes_to_desktop_db():
                 conn.execute("INSERT OR REPLACE INTO web_class_sync(web_class_id,section_id) VALUES(?,?)", (cls["id"], section_id))
 
 
-def launch_desktop_script(script, *args, startup_wait=1.5):
-    """Start a desktop window in its own Windows console and retain startup errors."""
+def launch_desktop_script(script, *args, startup_wait=1.5, session_id=None):
+    """Start a desktop window in its own Windows console and retain startup errors.
+
+    When session_id is supplied the process id is recorded in the attendance
+    sessions table immediately after Popen returns, before the startup wait.
+    This closes the race where a child that dies during camera initialization
+    leaves a "running" session with no PID, which the scheduler then cannot
+    detect as stale.
+    """
     script = Path(script).resolve()
     if not script.is_file():
         raise FileNotFoundError(f"Desktop program was not found: {script.name}")
@@ -704,8 +715,15 @@ def launch_desktop_script(script, *args, startup_wait=1.5):
             stderr=subprocess.STDOUT,
             creationflags=creationflags,
         )
+    if session_id is not None:
+        with db() as conn:
+            conn.execute("UPDATE attendance_sessions SET process_id=? WHERE id=?",
+                         (process.pid, session_id))
     time.sleep(startup_wait)
     if process.poll() is not None:
+        if session_id is not None:
+            with db() as conn:
+                conn.execute("UPDATE attendance_sessions SET process_id=NULL WHERE id=?", (session_id,))
         details = log_path.read_text(encoding="utf-8", errors="replace")[-1800:].strip()
         explanation = details or "The program closed during startup without reporting an error."
         raise RuntimeError(f"{script.name} closed during startup (exit {process.returncode}). {explanation} Log: {log_path}")
@@ -1540,7 +1558,8 @@ def launch_class_attendance(session_id, class_id):
     if not script.is_file():
         raise FileNotFoundError("class_attendance_web.py is missing from the project folder.")
     process_id, _log_path = launch_desktop_script(
-        script, "--session-id", session_id, "--class-id", class_id, startup_wait=3.0
+        script, "--session-id", session_id, "--class-id", class_id,
+        startup_wait=3.0, session_id=session_id,
     )
     return process_id
 
@@ -1575,8 +1594,6 @@ def class_attendance_page(class_id):
                 conn.execute("UPDATE attendance_sessions SET status='running',started_at=?,launch_attempts=launch_attempts+1 WHERE id=? AND status IN ('scheduled','failed')",
                              (now.isoformat(timespec="seconds"), session_id))
             pid = launch_class_attendance(session_id, class_id)
-            with db() as conn:
-                conn.execute("UPDATE attendance_sessions SET process_id=? WHERE id=?", (pid, session_id))
             audit("attendance_started_manually", "session", session_id, f"class={class_id}; subject={subject['name']}")
             flash(f"Attendance camera launched for {subject['name']}.", "success")
         except (ValueError, OSError, RuntimeError, sqlite3.Error) as exc:
@@ -1688,9 +1705,44 @@ def export_class_session_csv(class_id, session_id):
                     headers={"Content-Disposition": f"attachment; filename={filename}"})
 
 
+def recover_stale_sessions(now):
+    """Fail sessions that have been 'running' far past their scheduled window.
+
+    os.kill(pid, 0) only proves the process exists; it cannot tell a healthy
+    camera process from one that is hung on a frozen camera or an endless
+    liveness challenge. Any session whose start time predates the end of its
+    scheduled window plus the 30-minute grace plus a 5-minute buffer is
+    considered unrecoverable and reset so the scheduler can relaunch it.
+    """
+    try:
+        with db() as conn:
+            rows = conn.execute("""SELECT id, started_at, session_date, end_time FROM attendance_sessions
+                WHERE status='running' AND started_at IS NOT NULL""").fetchall()
+        for row in rows:
+            try:
+                started = datetime.fromisoformat(row["started_at"])
+            except (ValueError, TypeError):
+                continue
+            try:
+                end_dt = datetime.strptime(f"{row['session_date']} {row['end_time']}", "%Y-%m-%d %H:%M")
+            except (ValueError, TypeError):
+                continue
+            deadline = end_dt + timedelta(minutes=GRACE_MINUTES + 5)
+            if now <= deadline:
+                continue
+            with db() as conn:
+                conn.execute("UPDATE attendance_sessions SET status='failed', process_id=NULL WHERE id=?",
+                             (row["id"],))
+            audit("attendance_session_stale", "session", row["id"],
+                  f"running since {row['started_at']} past deadline {deadline.isoformat(timespec='seconds')}")
+    except sqlite3.Error:
+        pass
+
+
 def scheduler_tick(now=None):
     """Launch scheduled sessions once per timetable entry/date; start only within a 30-minute grace window."""
     now = now or datetime.now()
+    recover_stale_sessions(now)
     day_name = now.strftime("%A")
     current = now.strftime("%H:%M")
     lower = (now - timedelta(minutes=30)).strftime("%H:%M")
@@ -1720,8 +1772,6 @@ def scheduler_tick(now=None):
                 conn.execute("""UPDATE attendance_sessions SET status='running',started_at=COALESCE(started_at,?),
                     launch_attempts=launch_attempts+1 WHERE id=?""", (now.isoformat(timespec="seconds"), session_id))
             pid = launch_class_attendance(session_id, entry["class_id"])
-            with db() as conn:
-                conn.execute("UPDATE attendance_sessions SET process_id=? WHERE id=?", (pid, session_id))
             audit("attendance_auto_started", "session", session_id, f"timetable={entry['id']}")
         except Exception as exc:
             if session_id:
