@@ -4,7 +4,7 @@ This build keeps the original Python/Tkinter face-registration tool and OpenCV Y
 
 ## What is connected here
 
-- HOD first-time setup and sign-in; passwords are hashed.
+- HOD first-time setup and sign-in; passwords are hashed with Werkzeug's `generate_password_hash`.
 - HOD-managed departments and classes.
 - Class-specific student membership. The dashboard opens the existing Tkinter Student Manager for face registration; it does not replace it with a web registration form.
 - Before the Tkinter Student Manager opens, web classes are synchronized into its legacy SQLite class selector. A newly registered student is linked to the matching web class automatically when the mapping is available.
@@ -14,7 +14,7 @@ This build keeps the original Python/Tkinter face-registration tool and OpenCV Y
 - Scheduled attendance launch while the local Flask app is running. The scheduler checks every 15 seconds and catches up for timetable entries whose start time was within the last 30 minutes. It creates at most one session per timetable entry/date.
 - Class-scoped face recognition in `class_attendance_web.py`. It reads only the class's assigned student roster and the existing `dataset/face_features.json`; it writes records into SQLite and prevents duplicate attendance per student/session.
 - The dashboard shows each student's class/section, and includes a selected-date class/session breakdown with named Present, Absent, Excused, and Unmarked rosters. It reads legacy daily CSVs plus both desktop and web class-session databases.
-- Session reports let HODs and assigned lecturers review the full roster, record Present/Late/Absent/Excused statuses, correct face-recognition misses, and export a session CSV. Corrections are recorded in the audit log.
+- Session reports let HODs and assigned lecturers review the full roster, record Present/Late/Absent/Excused statuses, correct face-recognition misses, and export a session CSV. Corrections are recorded in an audit log.
 - The dashboard attendance shortcut opens the original desktop class/subject window. Its SQLite attendance is included in the web dashboard's daily history; class workspaces continue to use class-scoped session reports.
 - Audit entries for key account, assignment, subject, timetable, and attendance actions.
 
@@ -33,7 +33,7 @@ This build keeps the original Python/Tkinter face-registration tool and OpenCV Y
 
 ## Setup on Windows
 
-1. Install a supported Python version and ensure the Tkinter component is installed.
+1. Install a supported Python version (3.10+) and ensure the Tkinter component is installed.
 2. Open PowerShell in this project folder:
 
    ```powershell
@@ -43,7 +43,10 @@ This build keeps the original Python/Tkinter face-registration tool and OpenCV Y
    python -m pip install -r requirements.txt
    ```
 
-3. Copy the two ONNX model files into `models/` (see above).
+3. Copy the required ONNX model files into `models/`:
+   - **YuNet face detector:** `models/face_detection_yunet_2023mar.onnx`
+   - **SFace face recognizer:** `models/face_recognition_sface_2021dec.onnx`
+   - **Face landmarker:** `models/face_landmarker.task`
 4. Start the dashboard:
 
    ```powershell
@@ -92,25 +95,37 @@ Attendance camera flows use MediaPipe Face Landmarker with iris landmarks for pa
 
 The Face Landmarker model is stored at `models/face_landmarker.task`. Install the runtime with `.venv\Scripts\python.exe -m pip install -r requirements.txt`. These RGB webcam checks raise the bar against static photos and printed attacks but do not guarantee protection against display-based video replays or sophisticated spoofing.
 
-## Existing desktop tools retained
-
-- `student_manager.py` — primary Tkinter face registration/student status UI.
-- `class_manager.py` — legacy category/course/semester/section management UI.
-- `dashboard.py` — original Tkinter dashboard.
-- `attendance.py` — standalone daily CSV attendance.
-- `class_attendance.py` — original SQLite section-based attendance workflow.
-- `class_attendance_web.py` — class-specific attendance launched by the integrated web dashboard.
-- `database.py` — original desktop SQLite schema initializer.
-- `timetable_manager.py` — original local CSV/XLSX timetable JSON utility.
-
 ## Data and backup
 
 Runtime databases and biometric data are created under `dataset/`; daily CSVs are stored in `attendance_records/`. These files are intentionally excluded from source-control defaults. Back up local data securely. Do not upload real student face embeddings, biometric samples, populated databases, or attendance files to a public repository.
 
+## Database schema
+
+### Web dashboard database (`dataset/dashboard_admin.db`)
+
+- `users` - HOD and lecturer accounts (id, username, password_hash, role, display_name, is_active)
+- `departments` - Engineering departments (code, name, description)
+- `classes` - Classes with code, department, semester, section, academic_year
+- `class_students` - Many-to-many linking students to classes
+- `subjects` - Subjects per class (code, name)
+- `lecturer_assignments` - Link lecturers to classes and optional subjects
+- `timetable_entries` - Scheduled class sessions (day, start_time, end_time, room)
+- `attendance_sessions` - Class sessions with status (scheduled/running/completed/failed)
+- `attendance_records` - Per-student attendance (roll, status, marked_at)
+- `audit_logs` - Activity trail for security and compliance
+
+### Legacy desktop database (`dataset/smart_attendance.db`)
+
+The original Tkinter tools use a separate SQLite database with their own schema for students in sections, courses, and attendance records.
+
 ## Validation performed for this package
 
-- Python syntax compilation for the updated Flask app and new class attendance runner.
+- Python syntax compilation for the updated Flask app, liveness module, and class attendance runner.
 - Jinja parsing for the HTML templates.
 - Template endpoint-name consistency check.
 
 A live Flask/camera integration test could not be completed in this environment because Flask is not installed here and the ONNX model files/webcam were not supplied. Install the requirements and test on the target Windows computer before using the system for real attendance.
+
+## License
+
+This project is provided for educational and administrative use in academic institutions. Handle student biometric data with care and ensure compliance with local privacy regulations and institutional policies.
