@@ -1564,7 +1564,7 @@ def launch_class_attendance(session_id, class_id):
     return process_id
 
 
-@app.route("/classes/<int:class_id>/attendance", methods=["GET", "POST"])
+@app.route("/classes/<int:class_id>/attendance", methods=["GET"])
 @class_access_required
 def class_attendance_page(class_id):
     with db() as conn:
@@ -1579,29 +1579,6 @@ def class_attendance_page(class_id):
             allowed_subjects = {r[0] for r in conn.execute("SELECT subject_id FROM lecturer_assignments WHERE user_id=? AND class_id=? AND subject_id IS NOT NULL", (session["user_id"], class_id))}
         if not class_wide:
             subjects = [s for s in subjects if s["id"] in allowed_subjects]
-    if request.method == "POST":
-        session_id = None
-        try:
-            subject_id = int(request.form.get("subject_id", ""))
-            subject = next((s for s in subjects if s["id"] == subject_id), None)
-            if not subject:
-                raise ValueError("Choose a subject assigned to you and belonging to this class.")
-            now = datetime.now()
-            start = now.strftime("%H:%M")
-            end = (now + timedelta(minutes=60)).strftime("%H:%M")
-            session_id, _created = create_attendance_session(class_id, subject_id, now.date().isoformat(), start, end)
-            with db() as conn:
-                conn.execute("UPDATE attendance_sessions SET status='running',started_at=?,launch_attempts=launch_attempts+1 WHERE id=? AND status IN ('scheduled','failed')",
-                             (now.isoformat(timespec="seconds"), session_id))
-            pid = launch_class_attendance(session_id, class_id)
-            audit("attendance_started_manually", "session", session_id, f"class={class_id}; subject={subject['name']}")
-            flash(f"Attendance camera launched for {subject['name']}.", "success")
-        except (ValueError, OSError, RuntimeError, sqlite3.Error) as exc:
-            if session_id is not None:
-                with db() as conn:
-                    conn.execute("UPDATE attendance_sessions SET status='failed',process_id=NULL WHERE id=? AND status='running'", (session_id,))
-            flash(f"Could not start attendance: {exc}", "error")
-        return redirect(url_for("class_attendance_page", class_id=class_id))
     with db() as conn:
         sessions = conn.execute("""SELECT a.*,s.code AS subject_code,s.name AS subject_name,
             (SELECT COUNT(*) FROM attendance_records r WHERE r.session_id=a.id AND r.status IN ('Present','Late')) AS present_count
@@ -1613,6 +1590,68 @@ def class_attendance_page(class_id):
                 sessions = [r for r in sessions if r["subject_id"] in allowed_subjects]
     return render_template("class_attendance.html", class_record=class_record, subjects=subjects, sessions=sessions,
                            admin_user=session.get("username", "user"))
+
+
+@app.route("/classes/<int:class_id>/attendance/start-mode", methods=["POST"])
+@class_access_required
+def start_attendance_mode(class_id):
+    mode = request.form.get("mode")
+    now = datetime.now()
+    session_id = None
+    try:
+        if mode == "scheduled":
+            # Find the active timetable entry for today/now, with fallback to the next upcoming slot
+            current_day = now.strftime("%A")
+            current_time = now.strftime("%H:%M")
+            with db() as conn:
+                timetable = conn.execute(
+                    """SELECT t.id, t.subject_id, t.start_time, t.end_time FROM timetable_entries t
+                    WHERE t.class_id=? AND t.day_of_week=? AND t.start_time<=? AND t.end_time>=?""",
+                    (class_id, current_day, current_time, current_time)
+                ).fetchone()
+                if not timetable:
+                    # Fallback: find the next upcoming session today
+                    timetable = conn.execute(
+                        """SELECT t.id, t.subject_id, t.start_time, t.end_time FROM timetable_entries t
+                        WHERE t.class_id=? AND t.day_of_week=? AND t.start_time>?
+                        ORDER BY t.start_time ASC LIMIT 1""",
+                        (class_id, current_day, current_time)
+                    ).fetchone()
+                    if timetable:
+                        flash("Starting the next upcoming scheduled session.", "info")
+                    else:
+                        flash("No scheduled session found for today.", "error")
+                        return redirect(url_for("class_attendance_page", class_id=class_id))
+                # Create/find session linked to the timetable entry
+                session_id, _ = create_attendance_session(
+                    class_id,
+                    timetable["subject_id"],
+                    now.date().isoformat(),
+                    timetable["start_time"],
+                    timetable["end_time"],
+                    timetable["id"]
+                )
+        else:
+            # Manual session
+            subject_id = int(request.form.get("subject_id", ""))
+            start = now.strftime("%H:%M")
+            end = (now + timedelta(minutes=60)).strftime("%H:%M")
+            session_id, _ = create_attendance_session(class_id, subject_id, now.date().isoformat(), start, end)
+
+        with db() as conn:
+            conn.execute("UPDATE attendance_sessions SET status='running',started_at=?,launch_attempts=launch_attempts+1 WHERE id=? AND status IN ('scheduled','running','failed')",
+                         (now.isoformat(timespec="seconds"), session_id))
+
+        pid = launch_class_attendance(session_id, class_id)
+        flash(f"Attendance camera launched (Session #{session_id}).", "success")
+
+    except Exception as exc:
+        if session_id:
+            with db() as conn:
+                conn.execute("UPDATE attendance_sessions SET status='failed',process_id=NULL WHERE id=? AND status='running'", (session_id,))
+        flash(f"Could not start attendance: {exc}", "error")
+
+    return redirect(url_for("class_attendance_page", class_id=class_id))
 
 
 @app.route("/classes/<int:class_id>/sessions/<int:session_id>", methods=["GET", "POST"])

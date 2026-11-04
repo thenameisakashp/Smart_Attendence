@@ -865,10 +865,22 @@ class ClassAttendanceApp:
 # =====================================================
 
 if __name__ == "__main__":
-
+    import sys
     root = tk.Tk()
-
     app = ClassAttendanceApp(root)
+    # Pre-fill class/subject if passed from web UI
+    if len(sys.argv) >= 5 and sys.argv[1] == "--class-id" and sys.argv[3] == "--subject-id":
+        try:
+            class_id = int(sys.argv[2])
+            subject_name = sys.argv[4]
+            # Find class index by matching section_id
+            for idx, cls in enumerate(app.classes):
+                if cls['section_id'] == class_id:
+                    app.class_box.current(idx)
+                    break
+            app.subject_var.set(subject_name)
+        except Exception:
+            pass
 
     def bring_attendance_window_forward():
         root.deiconify()
