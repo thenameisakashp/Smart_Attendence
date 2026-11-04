@@ -126,6 +126,6 @@ The original Tkinter tools use a separate SQLite database with their own schema 
 
 A live Flask/camera integration test could not be completed in this environment because Flask is not installed here and the ONNX model files/webcam were not supplied. Install the requirements and test on the target Windows computer before using the system for real attendance.
 
-## License
+## License.
 
 This project is provided for educational and administrative use in academic institutions. Handle student biometric data with care and ensure compliance with local privacy regulations and institutional policies.
