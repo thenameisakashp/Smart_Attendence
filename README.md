@@ -4,6 +4,7 @@ This build keeps the original Python/Tkinter face-registration tool and OpenCV Y
 
 ## What is connected here
 
+
 - HOD first-time setup and sign-in; passwords are hashed with Werkzeug's `generate_password_hash`.
 - HOD-managed departments and classes as admin .
 - Class-specific student membership. The dashboard opens the existing Tkinter Student Manager for face registration; it does not replace it with a web registration form.

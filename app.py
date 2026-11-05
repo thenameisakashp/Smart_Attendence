@@ -7,6 +7,7 @@ import csv, json, io, os, sqlite3, subprocess, sys, calendar, secrets, time
 from werkzeug.security import generate_password_hash, check_password_hash
 from collections import defaultdict
 
+
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("SMART_ATTENDANCE_DATA_DIR", BASE_DIR / "dataset")).expanduser()
 # Scheduler catch-up grace period; must match the window used by class_attendance_web.py.
@@ -254,6 +255,7 @@ def load_students():
                         }
         except (OSError, json.JSONDecodeError):
             pass
+        
     try:
         with db() as conn:
             for row in conn.execute("SELECT roll, display_name FROM student_overrides"):

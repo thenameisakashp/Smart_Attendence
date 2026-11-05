@@ -24,6 +24,7 @@ try:
 
     if not rows:
         print("No attendance sessions found yet.")
+        
 
     for row in rows:
         print("-" * 45)
