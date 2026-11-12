@@ -8,7 +8,6 @@ from database import (
     get_categories,
 )
 
-
 class ClassManager:
     def __init__(self, root):
         self.root = root
@@ -73,7 +72,6 @@ class ClassManager:
             "semester",
             "section",
         )
-
         self.tree = ttk.Treeview(
             table_frame,
             columns=columns,

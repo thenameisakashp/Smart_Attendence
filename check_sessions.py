@@ -1,5 +1,4 @@
 from database import get_connection
-
 connection = get_connection()
 
 try:
@@ -24,7 +23,6 @@ try:
 
     if not rows:
         print("No attendance sessions found yet.")
-        
 
     for row in rows:
         print("-" * 45)

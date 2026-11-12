@@ -21,7 +21,6 @@ class LivenessError(Exception):
     """Raised when liveness verification fails due to configuration or runtime issues."""
     pass
 
-
 class LivenessChallenge:
     """Calculate a 0-100 passive/active score and require random actions."""
 
