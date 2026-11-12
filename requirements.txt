@@ -4,3 +4,4 @@ mediapipe>=1.1.1
 numpy>=1.24
 openpyxl>=3.1
 reportlab>=4.0
+psutil>=5.9

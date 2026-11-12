@@ -18,14 +18,14 @@ from liveness import LivenessChallenge, LivenessError
 import cv2
 import numpy as np
 
+from constants import RECOGNITION_THRESHOLD, GRACE_MINUTES, LIVENESS_PASS_THRESHOLD
+
 BASE_DIR = Path(__file__).resolve().parent
 DATASET_DIR = BASE_DIR / "dataset"
 DB_PATH = DATASET_DIR / "dashboard_admin.db"
 FEATURES_PATH = DATASET_DIR / "face_features.json"
 DETECTOR_PATH = BASE_DIR / "models" / "face_detection_yunet_2023mar.onnx"
 RECOGNIZER_PATH = BASE_DIR / "models" / "face_recognition_sface_2021dec.onnx"
-RECOGNITION_THRESHOLD = 0.45
-GRACE_MINUTES = 30
 
 
 @contextmanager
@@ -105,8 +105,9 @@ def main(session_id: int, class_id: int) -> int:
 
     scheduled_end = datetime.strptime(f"{session_row['session_date']} {session_row['end_time']}", "%Y-%m-%d %H:%M")
     hard_deadline = scheduled_end + timedelta(minutes=GRACE_MINUTES)
-    if hard_deadline <= datetime.now():
-        hard_deadline = datetime.now() + timedelta(minutes=5)
+    min_deadline = datetime.now() + timedelta(minutes=10)
+    if hard_deadline < min_deadline:
+        hard_deadline = min_deadline
 
     with connect() as conn:
         conn.execute("UPDATE attendance_sessions SET status='running', started_at=COALESCE(started_at,?) WHERE id=?",
@@ -118,9 +119,6 @@ def main(session_id: int, class_id: int) -> int:
     seen_this_run = set()
     liveness_checks = {}
     status_message = "Attendance running"
-    conn = sqlite3.connect(DB_PATH, timeout=10)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA foreign_keys=ON")
     try:
         while datetime.now() <= hard_deadline:
             ok, frame = cap.read()
@@ -148,37 +146,34 @@ def main(session_id: int, class_id: int) -> int:
                             try:
                                 live, prompt = challenge.update(frame, face)
                             except LivenessError as le:
-                                # Liveness model error - allow attendance with warning
-                                print(f"WARNING: Liveness check failed: {le}")
-                                member = conn.execute("SELECT 1 FROM class_students WHERE class_id=? AND roll=?",
-                                                      (class_id, best_roll)).fetchone()
-                                if member:
-                                    conn.execute("INSERT INTO attendance_records(session_id,roll,student_name,status,marked_at) VALUES(?,?,?,?,?)",
-                                                 (session_id, best_roll, record["name"], "Present", datetime.now().isoformat(timespec="seconds")))
-                                    seen_this_run.add(best_roll)
-                                    label, color = f"{record['name']} {best_score:.2f} (no liveness check)", (0, 150, 150)
+                                # Liveness model error - do NOT mark attendance; log and show error
+                                print(f"ERROR: Liveness check failed: {le}")
+                                label, color = f"{record['name']}: Liveness check unavailable", (0, 0, 255)
                             else:
                                 if live:
-                                    member = conn.execute("SELECT 1 FROM class_students WHERE class_id=? AND roll=?",
-                                                          (class_id, best_roll)).fetchone()
-                                    if member:
-                                        try:
-                                            conn.execute("INSERT INTO attendance_records(session_id,roll,student_name,status,marked_at) VALUES(?,?,?,?,?)",
-                                                         (session_id, best_roll, record["name"], "Present", datetime.now().isoformat(timespec="seconds")))
-                                            seen_this_run.add(best_roll)
-                                            status_message = f"Marked present: {record['name']}"
-                                            label, color = f"{record['name']} {best_score:.2f}", (0, 200, 0)
-                                        except sqlite3.IntegrityError:
-                                            label, color = f"{record['name']} (already marked)", (0, 220, 220)
-                                    else:
-                                        label = "Not assigned to this class"
+                                    with connect() as conn:
+                                        member = conn.execute("SELECT 1 FROM class_students WHERE class_id=? AND roll=?",
+                                                              (class_id, best_roll)).fetchone()
+                                        if member:
+                                            try:
+                                                conn.execute("INSERT INTO attendance_records(session_id,roll,student_name,status,marked_at) VALUES(?,?,?,?,?)",
+                                                             (session_id, best_roll, record["name"], "Present", datetime.now().isoformat(timespec="seconds")))
+                                                seen_this_run.add(best_roll)
+                                                status_message = f"Marked present: {record['name']}"
+                                                label, color = f"{record['name']} {best_score:.2f}", (0, 200, 0)
+                                            except sqlite3.IntegrityError:
+                                                label, color = f"{record['name']} (already marked)", (0, 220, 220)
+                                        else:
+                                            label = "Not assigned to this class"
                                 else:
                                     label, color = f"{record['name']}: {prompt}", (0, 165, 255)
                     except Exception as exc:
                         label = f"Recognition error: {type(exc).__name__}"
                     cv2.rectangle(frame, (x, y), (x + w, y + h), color, 2)
                     cv2.putText(frame, label[:70], (x, max(22, y - 8)), cv2.FONT_HERSHEY_SIMPLEX, 0.55, color, 2)
-            present_count = conn.execute("SELECT COUNT(*) FROM attendance_records WHERE session_id=? AND status IN ('Present','Late')", (session_id,)).fetchone()[0]
+            with connect() as conn:
+                row = conn.execute("SELECT COUNT(*) FROM attendance_records WHERE session_id=? AND status IN ('Present','Late')", (session_id,)).fetchone()
+                present_count = row[0] if row else 0
             remaining = max(0, int((hard_deadline - datetime.now()).total_seconds()))
             cv2.putText(frame, f"{session_row['class_code']} | {session_row['subject_name']} | Present: {present_count}/{len(allowed_rolls)}",
                         (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.62, (255, 255, 255), 2)
@@ -189,8 +184,6 @@ def main(session_id: int, class_id: int) -> int:
             if key in (ord('q'), 27):
                 break
     finally:
-        conn.commit()
-        conn.close()
         cap.release()
         cv2.destroyAllWindows()
         finish_session(session_id)

@@ -25,7 +25,6 @@ class LivenessChallenge:
     """Calculate a 0-100 passive/active score and require random actions."""
 
     _landmarker = None
-    _timestamp_ms = 0
     _LEFT_EYE = (362, 385, 387, 263, 373, 380)
     _RIGHT_EYE = (33, 160, 158, 133, 153, 144)
     _MOUTH_WIDTH = (61, 291)
@@ -176,9 +175,8 @@ class LivenessChallenge:
                 return False, "Center your face"
             rgb = cv2.cvtColor(frame[y0:y1, x0:x1], cv2.COLOR_BGR2RGB)
             image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
-            cls = type(self)
-            cls._timestamp_ms = max(cls._timestamp_ms + 1, int(time.monotonic() * 1000))
-            result = self._get_landmarker().detect_for_video(image, cls._timestamp_ms)
+            timestamp_ms = int(time.monotonic() * 1000)
+            result = self._get_landmarker().detect_for_video(image, timestamp_ms)
             if not result.face_landmarks:
                 return False, "Center your face; keep it visible"
             points = result.face_landmarks[0]

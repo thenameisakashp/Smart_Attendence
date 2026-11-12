@@ -7,11 +7,19 @@ import csv, json, io, os, sqlite3, subprocess, sys, calendar, secrets, time
 from werkzeug.security import generate_password_hash, check_password_hash
 from collections import defaultdict
 
+import psutil
+
+from constants import (
+    GRACE_MINUTES,
+    RECOGNITION_THRESHOLD,
+    LIVENESS_PASS_THRESHOLD,
+    SCHEDULER_INTERVAL_SECONDS,
+    STALE_SESSION_BUFFER_MINUTES,
+)
+
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = Path(os.environ.get("SMART_ATTENDANCE_DATA_DIR", BASE_DIR / "dataset")).expanduser()
-# Scheduler catch-up grace period; must match the window used by class_attendance_web.py.
-GRACE_MINUTES = 30
 if not DATA_DIR.is_absolute():
     DATA_DIR = (BASE_DIR / DATA_DIR).resolve()
 FEATURES_FILE = DATA_DIR / "face_features.json"
@@ -1749,11 +1757,11 @@ def export_class_session_csv(class_id, session_id):
 def recover_stale_sessions(now):
     """Fail sessions that have been 'running' far past their scheduled window.
 
-    os.kill(pid, 0) only proves the process exists; it cannot tell a healthy
-    camera process from one that is hung on a frozen camera or an endless
-    liveness challenge. Any session whose start time predates the end of its
-    scheduled window plus the 30-minute grace plus a 5-minute buffer is
-    considered unrecoverable and reset so the scheduler can relaunch it.
+    psutil.Process(pid).is_running() only proves the process exists; it cannot
+    tell a healthy camera process from one that is hung on a frozen camera or
+    an endless liveness challenge. Any session whose start time predates the end
+    of its scheduled window plus the grace period plus a buffer is considered
+    unrecoverable and reset so the scheduler can relaunch it.
     """
     try:
         with db() as conn:
@@ -1768,7 +1776,7 @@ def recover_stale_sessions(now):
                 end_dt = datetime.strptime(f"{row['session_date']} {row['end_time']}", "%Y-%m-%d %H:%M")
             except (ValueError, TypeError):
                 continue
-            deadline = end_dt + timedelta(minutes=GRACE_MINUTES + 5)
+            deadline = end_dt + timedelta(minutes=GRACE_MINUTES + STALE_SESSION_BUFFER_MINUTES)
             if now <= deadline:
                 continue
             with db() as conn:
@@ -1781,16 +1789,22 @@ def recover_stale_sessions(now):
 
 
 def scheduler_tick(now=None):
-    """Launch scheduled sessions once per timetable entry/date; start only within a 30-minute grace window."""
+    """Launch scheduled sessions once per timetable entry/date; start within grace window or if currently ongoing."""
     now = now or datetime.now()
     recover_stale_sessions(now)
     day_name = now.strftime("%A")
     current = now.strftime("%H:%M")
-    lower = (now - timedelta(minutes=30)).strftime("%H:%M")
+    # Catch-up window: classes that started within GRACE_MINUTES
+    lower_catchup = (now - timedelta(minutes=GRACE_MINUTES)).strftime("%H:%M")
+    # Also catch currently ongoing classes: start_time <= now AND end_time >= now
     with db() as conn:
         entries = conn.execute("""SELECT t.*,s.name AS subject_name FROM timetable_entries t
-            JOIN subjects s ON s.id=t.subject_id WHERE t.is_active=1 AND t.day_of_week=? AND t.start_time<=? AND t.start_time>=?""",
-            (day_name, current, lower)).fetchall()
+            JOIN subjects s ON s.id=t.subject_id WHERE t.is_active=1 AND t.day_of_week=?
+            AND (
+                (t.start_time <= ? AND t.start_time >= ?)  -- catch-up: started in last GRACE_MINUTES
+                OR (t.start_time <= ? AND t.end_time >= ?) -- ongoing: class is in session right now
+            )""",
+            (day_name, current, lower_catchup, current, current)).fetchall()
     for entry in entries:
         session_id = None
         try:
@@ -1803,9 +1817,9 @@ def scheduler_tick(now=None):
                     continue
                 if existing["status"] == "running" and existing["process_id"]:
                     try:
-                        os.kill(int(existing["process_id"]), 0)
-                        continue  # the previous camera process is still alive
-                    except (OSError, ValueError, TypeError):
+                        if psutil.Process(int(existing["process_id"])).is_running():
+                            continue  # the previous camera process is still alive
+                    except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError, TypeError):
                         pass  # stale process record; safe to recover the existing session
                 if existing["launch_attempts"] >= 2:
                     continue
