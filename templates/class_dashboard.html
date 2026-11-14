@@ -20,6 +20,7 @@
                         <a href="{{ url_for('class_students',class_id=class_record.id) }}">♙ Students</a>
                         <a href="{{ url_for('class_timetable',class_id=class_record.id) }}">◷ Timetable</a>
                         <a href="{{ url_for('class_attendance_page',class_id=class_record.id) }}">✓ Attendance & reports</a>
+                        <a href="{{ url_for('lectures_page') }}">◷ Lectures Today</a>
                         <a href="{{ url_for('department_management') if user_role=='hod' else url_for('lecturer_dashboard') }}">← Back</a>
                     </nav>
                     <div class="side-bottom">

@@ -121,11 +121,13 @@ def init_db():
             session_date TEXT NOT NULL, start_time TEXT NOT NULL, end_time TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT 'scheduled', source_timetable_id INTEGER,
             started_at TEXT, completed_at TEXT, process_id INTEGER, launch_attempts INTEGER NOT NULL DEFAULT 0,
+            started_by_user_id INTEGER,
             created_at TEXT NOT NULL,
             UNIQUE(source_timetable_id, session_date),
             FOREIGN KEY(class_id) REFERENCES classes(id) ON DELETE CASCADE,
             FOREIGN KEY(subject_id) REFERENCES subjects(id) ON DELETE RESTRICT,
-            FOREIGN KEY(source_timetable_id) REFERENCES timetable_entries(id) ON DELETE SET NULL)""")
+            FOREIGN KEY(source_timetable_id) REFERENCES timetable_entries(id) ON DELETE SET NULL,
+            FOREIGN KEY(started_by_user_id) REFERENCES users(id) ON DELETE SET NULL)""")
         conn.execute("""CREATE TABLE IF NOT EXISTS attendance_records (
             id INTEGER PRIMARY KEY AUTOINCREMENT, session_id INTEGER NOT NULL, roll TEXT NOT NULL,
             student_name TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'Present', marked_at TEXT NOT NULL,
@@ -139,6 +141,8 @@ def init_db():
             conn.execute("ALTER TABLE attendance_sessions ADD COLUMN process_id INTEGER")
         if "launch_attempts" not in session_columns:
             conn.execute("ALTER TABLE attendance_sessions ADD COLUMN launch_attempts INTEGER NOT NULL DEFAULT 0")
+        if "started_by_user_id" not in session_columns:
+            conn.execute("ALTER TABLE attendance_sessions ADD COLUMN started_by_user_id INTEGER")
         # Existing installations are assigned a neutral profile; first-time setup names the college.
         has_profile = conn.execute("SELECT 1 FROM institution_profile WHERE id=1").fetchone()
         has_user = conn.execute("SELECT 1 FROM users LIMIT 1").fetchone()
@@ -1529,6 +1533,120 @@ def timetable_page():
     return render_template("timetable.html", entries=entries, admin_user=session.get("username", "hod"))
 
 
+@app.get("/lectures")
+@role_required("hod")
+def lectures_page():
+    """HOD view: consolidated timetable with assigned lecturers and live session status."""
+    selected_date = request.args.get("date", date.today().isoformat())
+    try:
+        datetime.strptime(selected_date, "%Y-%m-%d")
+    except ValueError:
+        selected_date = date.today().isoformat()
+    day_name = datetime.strptime(selected_date, "%Y-%m-%d").strftime("%A")
+
+    with db() as conn:
+        # Get all timetable entries for this day with class, subject, and assigned lecturer info
+        entries = conn.execute("""
+            SELECT
+                t.id AS timetable_id,
+                t.day_of_week,
+                t.start_time,
+                t.end_time,
+                t.room,
+                c.id AS class_id,
+                c.class_code,
+                c.department,
+                c.semester,
+                c.section,
+                s.id AS subject_id,
+                s.code AS subject_code,
+                s.name AS subject_name,
+                u.id AS lecturer_id,
+                u.display_name AS lecturer_name,
+                u.username AS lecturer_username
+            FROM timetable_entries t
+            JOIN classes c ON c.id = t.class_id
+            JOIN subjects s ON s.id = t.subject_id
+            LEFT JOIN lecturer_assignments la ON la.class_id = c.id AND la.subject_id = s.id
+            LEFT JOIN users u ON u.id = la.user_id AND u.role = 'lecturer'
+            WHERE t.day_of_week = ? AND t.is_active = 1
+            ORDER BY t.start_time, c.class_code
+        """, (day_name,)).fetchall()
+
+        # Get live sessions for today
+        live_sessions = conn.execute("""
+            SELECT a.id, a.class_id, a.subject_id, a.session_date, a.start_time, a.end_time, a.status,
+                   a.started_at, a.started_by_user_id,
+                   u.display_name AS started_by_name,
+                   c.class_code, s.code AS subject_code, s.name AS subject_name
+            FROM attendance_sessions a
+            JOIN classes c ON c.id = a.class_id
+            JOIN subjects s ON s.id = a.subject_id
+            LEFT JOIN users u ON u.id = a.started_by_user_id
+            WHERE a.session_date = ? AND a.status IN ('running', 'scheduled')
+        """, (selected_date,)).fetchall()
+
+    # Build a lookup for live sessions
+    live_by_key = {}
+    for sess in live_sessions:
+        key = (sess["class_id"], sess["subject_id"])
+        live_by_key[key] = sess
+
+    # Build a lookup for assigned lecturers from assignments table
+    lecturer_by_key = {}
+    for entry in entries:
+        key = (entry["class_id"], entry["subject_id"])
+        if entry["lecturer_id"]:
+            lecturer_by_key[key] = {
+                "id": entry["lecturer_id"],
+                "name": entry["lecturer_name"],
+                "username": entry["lecturer_username"]
+            }
+
+    # Merge data for template
+    lecture_rows = []
+    for entry in entries:
+        key = (entry["class_id"], entry["subject_id"])
+        assigned_lecturer = lecturer_by_key.get(key)
+        live_session = live_by_key.get(key)
+
+        # Determine status
+        status = "scheduled"
+        if live_session:
+            status = live_session["status"]  # 'running' or 'scheduled'
+        elif assigned_lecturer:
+            status = "assigned"
+        else:
+            status = "unassigned"
+
+        lecture_rows.append({
+            "timetable_id": entry["timetable_id"],
+            "day": entry["day_of_week"],
+            "time": f"{entry['start_time']}–{entry['end_time']}",
+            "start_time": entry["start_time"],
+            "end_time": entry["end_time"],
+            "room": entry["room"],
+            "class_id": entry["class_id"],
+            "class_code": entry["class_code"],
+            "department": entry["department"],
+            "semester": entry["semester"],
+            "section": entry["section"],
+            "subject_id": entry["subject_id"],
+            "subject_code": entry["subject_code"],
+            "subject_name": entry["subject_name"],
+            "assigned_lecturer": assigned_lecturer,
+            "live_session": live_session,
+            "status": status,
+        })
+
+    return render_template("lectures.html",
+                           lecture_rows=lecture_rows,
+                           selected_date=selected_date,
+                           today=date.today().isoformat(),
+                           admin_user=session.get("username", "hod"),
+                           display_name=session.get("display_name", "HOD"))
+
+
 @app.get("/classes/<int:class_id>/timetable")
 @class_access_required
 def class_timetable(class_id):
@@ -1609,11 +1727,11 @@ def start_attendance_mode(class_id):
     now = datetime.now()
     session_id = None
     try:
-        if mode == "scheduled":
-            # Find the active timetable entry for today/now, with fallback to the next upcoming slot
-            current_day = now.strftime("%A")
-            current_time = now.strftime("%H:%M")
-            with db() as conn:
+        with db() as conn:
+            if mode == "scheduled":
+                # Find the active timetable entry for today/now, with fallback to the next upcoming slot
+                current_day = now.strftime("%A")
+                current_time = now.strftime("%H:%M")
                 timetable = conn.execute(
                     """SELECT t.id, t.subject_id, t.start_time, t.end_time FROM timetable_entries t
                     WHERE t.class_id=? AND t.day_of_week=? AND t.start_time<=? AND t.end_time>=?""",
@@ -1632,25 +1750,44 @@ def start_attendance_mode(class_id):
                     else:
                         flash("No scheduled session found for today.", "error")
                         return redirect(url_for("class_attendance_page", class_id=class_id))
+
+                subject_id = timetable["subject_id"]
+                # Enforce assignment check
+                assigned = conn.execute(
+                    "SELECT 1 FROM lecturer_assignments WHERE class_id=? AND (subject_id IS NULL OR subject_id=?)",
+                    (class_id, subject_id)
+                ).fetchone()
+                if not assigned:
+                    flash("Cannot start attendance: No lecturer assigned for this subject in this class.", "error")
+                    return redirect(url_for("class_attendance_page", class_id=class_id))
+
                 # Create/find session linked to the timetable entry
                 session_id, _ = create_attendance_session(
                     class_id,
-                    timetable["subject_id"],
+                    subject_id,
                     now.date().isoformat(),
                     timetable["start_time"],
                     timetable["end_time"],
                     timetable["id"]
                 )
-        else:
-            # Manual session
-            subject_id = int(request.form.get("subject_id", ""))
-            start = now.strftime("%H:%M")
-            end = (now + timedelta(minutes=60)).strftime("%H:%M")
-            session_id, _ = create_attendance_session(class_id, subject_id, now.date().isoformat(), start, end)
+            else:
+                # Manual session
+                subject_id = int(request.form.get("subject_id", ""))
+                # Check assignment for manual mode
+                assigned = conn.execute(
+                    "SELECT 1 FROM lecturer_assignments WHERE class_id=? AND (subject_id IS NULL OR subject_id=?)",
+                    (class_id, subject_id)
+                ).fetchone()
+                if not assigned:
+                    flash("Cannot start attendance: No lecturer assigned for this subject.", "error")
+                    return redirect(url_for("class_attendance_page", class_id=class_id))
 
-        with db() as conn:
-            conn.execute("UPDATE attendance_sessions SET status='running',started_at=?,launch_attempts=launch_attempts+1 WHERE id=? AND status IN ('scheduled','running','failed')",
-                         (now.isoformat(timespec="seconds"), session_id))
+                start = now.strftime("%H:%M")
+                end = (now + timedelta(minutes=60)).strftime("%H:%M")
+                session_id, _ = create_attendance_session(class_id, subject_id, now.date().isoformat(), start, end)
+
+            conn.execute("UPDATE attendance_sessions SET status='running',started_at=?,started_by_user_id=?,launch_attempts=launch_attempts+1 WHERE id=? AND status IN ('scheduled','running','failed')",
+                         (now.isoformat(timespec="seconds"), session.get("user_id"), session_id))
 
         pid = launch_class_attendance(session_id, class_id)
         flash(f"Attendance camera launched (Session #{session_id}).", "success")
@@ -1789,7 +1926,7 @@ def recover_stale_sessions(now):
 
 
 def scheduler_tick(now=None):
-    """Launch scheduled sessions once per timetable entry/date; start within grace window or if currently ongoing."""
+    """Create scheduled session records for timetable entries; do NOT auto-launch camera."""
     now = now or datetime.now()
     recover_stale_sessions(now)
     day_name = now.strftime("%A")
@@ -1806,38 +1943,17 @@ def scheduler_tick(now=None):
             )""",
             (day_name, current, lower_catchup, current, current)).fetchall()
     for entry in entries:
-        session_id = None
         try:
-            session_id, created = create_attendance_session(entry["class_id"], entry["subject_id"], now.date().isoformat(),
-                                                            entry["start_time"], entry["end_time"], entry["id"])
-            with db() as conn:
-                existing = conn.execute("SELECT status,process_id,launch_attempts FROM attendance_sessions WHERE id=?", (session_id,)).fetchone()
-            if not created and existing:
-                if existing["status"] in ("completed",):
-                    continue
-                if existing["status"] == "running" and existing["process_id"]:
-                    try:
-                        if psutil.Process(int(existing["process_id"])).is_running():
-                            continue  # the previous camera process is still alive
-                    except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError, TypeError):
-                        pass  # stale process record; safe to recover the existing session
-                if existing["launch_attempts"] >= 2:
-                    continue
-            with db() as conn:
-                conn.execute("""UPDATE attendance_sessions SET status='running',started_at=COALESCE(started_at,?),
-                    launch_attempts=launch_attempts+1 WHERE id=?""", (now.isoformat(timespec="seconds"), session_id))
-            pid = launch_class_attendance(session_id, entry["class_id"])
-            audit("attendance_auto_started", "session", session_id, f"timetable={entry['id']}")
+            # Just create/ensure the session record exists; do not launch process here.
+            create_attendance_session(entry["class_id"], entry["subject_id"], now.date().isoformat(),
+                                      entry["start_time"], entry["end_time"], entry["id"])
         except Exception as exc:
-            if session_id:
-                with db() as conn:
-                    conn.execute("UPDATE attendance_sessions SET status='failed',process_id=NULL WHERE id=?", (session_id,))
-            print(f"[scheduler] Could not launch timetable entry {entry['id']}: {exc}")
+            print(f"[scheduler] Could not prepare session for timetable entry {entry['id']}: {exc}")
 
 
 def scheduler_loop():
     import time
-    print("[scheduler] Timetable scheduler active; automatic attendance starts when a scheduled slot is reached (30-minute catch-up window).")
+    print("[scheduler] Timetable scheduler active; preparing sessions for dashboard activation.")
     while True:
         try:
             scheduler_tick()
