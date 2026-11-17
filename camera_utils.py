@@ -1,4 +1,5 @@
 """Shared webcam discovery for the desktop and class attendance workflows."""
+import time
 
 
 def diagnose_camera(cv2, preferred_index=0, max_index=3):
@@ -47,7 +48,7 @@ def diagnose_camera(cv2, preferred_index=0, max_index=3):
     return None, None
 
 
-def open_camera(cv2, preferred_index=0, max_index=3, allow_fallback=True):
+def open_camera(cv2, preferred_index=0, max_index=3, allow_fallback=True, max_retries=3, retry_delay=0.5):
     """Open and verify a webcam, trying common Windows backends and indexes.
 
     Args:
@@ -55,6 +56,8 @@ def open_camera(cv2, preferred_index=0, max_index=3, allow_fallback=True):
         preferred_index: Preferred camera index to try first
         max_index: Maximum camera index to check
         allow_fallback: If True, try alternate indexes when preferred fails
+        max_retries: Number of retries per camera/index/backend combination
+        retry_delay: Delay between retries in seconds
 
     Returns:
         cv2.VideoCapture object
@@ -87,25 +90,29 @@ def open_camera(cv2, preferred_index=0, max_index=3, allow_fallback=True):
         for backend, backend_name in backends:
             if backend is None:
                 continue
-            try:
-                cap = cv2.VideoCapture(index, backend)
-                if cap.isOpened():
-                    # Verify it returns actual frames
-                    ok, _frame = cap.read()
-                    if ok:
-                        try:
-                            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                        except (AttributeError, cv2.error):
-                            pass
-                        print(f"Webcam opened: device {index} ({backend_name}).")
-                        return cap
+            for attempt in range(max_retries):
+                try:
+                    cap = cv2.VideoCapture(index, backend)
+                    if cap.isOpened():
+                        # Verify it returns actual frames
+                        ok, _frame = cap.read()
+                        if ok:
+                            try:
+                                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                            except (AttributeError, cv2.error):
+                                pass
+                            print(f"Webcam opened: device {index} ({backend_name}).")
+                            return cap
+                        else:
+                            errors.append(f"device {index} ({backend_name}) opened but returned no valid frames")
+                        cap.release()
                     else:
-                        errors.append(f"device {index} ({backend_name}) opened but returned no valid frames")
-                    cap.release()
-                else:
-                    errors.append(f"device {index} ({backend_name}) unavailable")
-            except Exception as e:
-                errors.append(f"device {index} ({backend_name}) exception: {e}")
+                        errors.append(f"device {index} ({backend_name}) unavailable")
+                except Exception as e:
+                    errors.append(f"device {index} ({backend_name}) exception: {e}")
+
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
 
     # Build detailed diagnostic message
     error_parts = ["; ".join(errors)]
@@ -147,3 +154,20 @@ def test_camera_health(cv2, cap, num_frames=5):
         return True, f"Camera healthy ({frames[0].shape[1]}x{heights[0]})"
     except Exception as e:
         return False, f"Camera error: {e}"
+
+
+def quick_camera_check(cv2):
+    """Quick non-blocking camera availability check for health endpoint.
+
+    Returns (available: bool, message: str)
+    """
+    if cv2 is None:
+        return False, "OpenCV not available"
+
+    try:
+        found, backend = diagnose_camera(cv2)
+        if found is not None:
+            return True, f"Camera available at index {found} ({backend})"
+        return False, "No camera found"
+    except Exception as e:
+        return False, f"Camera check failed: {e}"
