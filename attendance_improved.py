@@ -26,7 +26,6 @@ ACTIVE_REFRESH_SECONDS = 1.0
 
 ATTENDANCE_DIR.mkdir(parents=True, exist_ok=True)
 
-
 # ---------------- VALIDATE FILES ----------------
 if not FEATURES_FILE.exists():
     raise FileNotFoundError(
@@ -42,7 +41,6 @@ if not DATABASE_FILE.exists():
         f"Student database not found: {DATABASE_FILE}\nInitialize the database first."
     )
 
-
 # ---------------- DATABASE HELPERS ----------------
 def get_active_roll_numbers():
     """Read current active students from SQLite."""
@@ -57,7 +55,6 @@ def get_active_roll_numbers():
         }
     finally:
         connection.close()
-
 
 def normalize_embedding(value):
     """Validate and L2-normalize one SFace embedding."""
