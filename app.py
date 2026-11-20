@@ -123,11 +123,15 @@ def init_db():
             started_at TEXT, completed_at TEXT, process_id INTEGER, launch_attempts INTEGER NOT NULL DEFAULT 0,
             started_by_user_id INTEGER,
             created_at TEXT NOT NULL,
+            heartbeat_at TEXT,          -- updated by camera process to prove liveness
+            locked INTEGER NOT NULL DEFAULT 0,  -- 1 = locked after finalization
             UNIQUE(source_timetable_id, session_date),
             FOREIGN KEY(class_id) REFERENCES classes(id) ON DELETE CASCADE,
             FOREIGN KEY(subject_id) REFERENCES subjects(id) ON DELETE RESTRICT,
             FOREIGN KEY(source_timetable_id) REFERENCES timetable_entries(id) ON DELETE SET NULL,
             FOREIGN KEY(started_by_user_id) REFERENCES users(id) ON DELETE SET NULL)""")
+        # New: idempotency key to prevent duplicates across timetable re-imports
+        # UNIQUE(class_id, subject_id, session_date, start_time) would be ideal but we add via migration below
         conn.execute("""CREATE TABLE IF NOT EXISTS attendance_records (
             id INTEGER PRIMARY KEY AUTOINCREMENT, session_id INTEGER NOT NULL, roll TEXT NOT NULL,
             student_name TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'Present', marked_at TEXT NOT NULL,
@@ -136,6 +140,19 @@ def init_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT, actor_user_id INTEGER, action TEXT NOT NULL,
             target_type TEXT NOT NULL DEFAULT '', target_id TEXT NOT NULL DEFAULT '', details TEXT NOT NULL DEFAULT '',
             created_at TEXT NOT NULL, FOREIGN KEY(actor_user_id) REFERENCES users(id) ON DELETE SET NULL)""")
+
+        # New tables for improvements
+        conn.execute("""CREATE TABLE IF NOT EXISTS system_settings (
+            key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL,
+            description TEXT NOT NULL DEFAULT '')""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS access_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, action TEXT NOT NULL,
+            ip TEXT, user_agent TEXT, created_at TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE SET NULL)""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS backup_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, filename TEXT NOT NULL,
+            size_bytes INTEGER, status TEXT NOT NULL, created_at TEXT NOT NULL)""")
+
         session_columns = {row[1] for row in conn.execute("PRAGMA table_info(attendance_sessions)")}
         if "process_id" not in session_columns:
             conn.execute("ALTER TABLE attendance_sessions ADD COLUMN process_id INTEGER")
@@ -143,6 +160,17 @@ def init_db():
             conn.execute("ALTER TABLE attendance_sessions ADD COLUMN launch_attempts INTEGER NOT NULL DEFAULT 0")
         if "started_by_user_id" not in session_columns:
             conn.execute("ALTER TABLE attendance_sessions ADD COLUMN started_by_user_id INTEGER")
+        if "heartbeat_at" not in session_columns:
+            conn.execute("ALTER TABLE attendance_sessions ADD COLUMN heartbeat_at TEXT")
+        if "locked" not in session_columns:
+            conn.execute("ALTER TABLE attendance_sessions ADD COLUMN locked INTEGER NOT NULL DEFAULT 0")
+
+        # Add unique index for idempotency (class_id, subject_id, session_date, start_time)
+        try:
+            conn.execute("""CREATE UNIQUE INDEX IF NOT EXISTS idx_attendance_sessions_idempotent
+                ON attendance_sessions(class_id, subject_id, session_date, start_time)""")
+        except sqlite3.Error:
+            pass  # index may already exist or conflict with existing data
         # Existing installations are assigned a neutral profile; first-time setup names the college.
         has_profile = conn.execute("SELECT 1 FROM institution_profile WHERE id=1").fetchone()
         has_user = conn.execute("SELECT 1 FROM users LIMIT 1").fetchone()
@@ -225,6 +253,39 @@ def audit(action, target_type="", target_id="", details=""):
                 (actor_id, action, target_type, str(target_id), details[:1000], datetime.now().isoformat(timespec="seconds")),
             )
     except Exception:
+        pass
+
+
+def log_access(action, user_id=None, ip=None, user_agent=None):
+    """Log access events for security monitoring."""
+    try:
+        with db() as conn:
+            conn.execute(
+                "INSERT INTO access_logs(user_id,action,ip,user_agent,created_at) VALUES(?,?,?,?,?)",
+                (user_id or session.get("user_id"), action, ip or request.remote_addr, user_agent or request.headers.get("User-Agent"), datetime.now().isoformat(timespec="seconds")),
+            )
+    except Exception:
+        pass
+
+
+def get_setting(key, default=None):
+    """Get a system setting value."""
+    try:
+        with db() as conn:
+            row = conn.execute("SELECT value FROM system_settings WHERE key=?", (key,)).fetchone()
+            return row["value"] if row else default
+    except sqlite3.Error:
+        return default
+
+
+def set_setting(key, value, description=""):
+    """Set a system setting value."""
+    try:
+        with db() as conn:
+            conn.execute("""INSERT INTO system_settings(key,value,updated_at,description) VALUES(?,?,?,?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at, description=excluded.description""",
+                (key, value, datetime.now().isoformat(timespec="seconds"), description))
+    except sqlite3.Error:
         pass
 
 
@@ -767,6 +828,109 @@ def launch_student_manager():
     return redirect(url_for("students_page"))
 
 
+def _build_lecture_rows(selected_date):
+    """Build lecture rows for today's schedule with assigned lecturers and live session status."""
+    import datetime
+    day_name = datetime.datetime.strptime(selected_date, "%Y-%m-%d").strftime("%A")
+
+    with db() as conn:
+        # Get all timetable entries for this day with class, subject, and assigned lecturer info
+        entries = conn.execute("""
+            SELECT
+                t.id AS timetable_id,
+                t.day_of_week,
+                t.start_time,
+                t.end_time,
+                t.room,
+                c.id AS class_id,
+                c.class_code,
+                c.department,
+                c.semester,
+                c.section,
+                s.id AS subject_id,
+                s.code AS subject_code,
+                s.name AS subject_name,
+                u.id AS lecturer_id,
+                u.display_name AS lecturer_name,
+                u.username AS lecturer_username
+            FROM timetable_entries t
+            JOIN classes c ON c.id = t.class_id
+            JOIN subjects s ON s.id = t.subject_id
+            LEFT JOIN lecturer_assignments la ON la.class_id = c.id AND la.subject_id = s.id
+            LEFT JOIN users u ON u.id = la.user_id AND u.role = 'lecturer'
+            WHERE t.day_of_week = ? AND t.is_active = 1
+            ORDER BY t.start_time, c.class_code
+        """, (day_name,)).fetchall()
+
+        # Get live sessions for today
+        live_sessions = conn.execute("""
+            SELECT a.id, a.class_id, a.subject_id, a.session_date, a.start_time, a.end_time, a.status,
+                   a.started_at, a.started_by_user_id,
+                   u.display_name AS started_by_name,
+                   c.class_code, s.code AS subject_code, s.name AS subject_name
+            FROM attendance_sessions a
+            JOIN classes c ON c.id = a.class_id
+            JOIN subjects s ON s.id = a.subject_id
+            LEFT JOIN users u ON u.id = a.started_by_user_id
+            WHERE a.session_date = ? AND a.status IN ('running', 'scheduled')
+        """, (selected_date,)).fetchall()
+
+    # Build a lookup for live sessions
+    live_by_key = {}
+    for sess in live_sessions:
+        key = (sess["class_id"], sess["subject_id"])
+        live_by_key[key] = sess
+
+    # Build a lookup for assigned lecturers from assignments table
+    lecturer_by_key = {}
+    for entry in entries:
+        key = (entry["class_id"], entry["subject_id"])
+        if entry["lecturer_id"]:
+            lecturer_by_key[key] = {
+                "id": entry["lecturer_id"],
+                "name": entry["lecturer_name"],
+                "username": entry["lecturer_username"]
+            }
+
+    # Merge data for template
+    lecture_rows = []
+    for entry in entries:
+        key = (entry["class_id"], entry["subject_id"])
+        assigned_lecturer = lecturer_by_key.get(key)
+        live_session = live_by_key.get(key)
+
+        # Determine status
+        status = "scheduled"
+        if live_session:
+            status = live_session["status"]  # 'running' or 'scheduled'
+        elif assigned_lecturer:
+            status = "assigned"
+        else:
+            status = "unassigned"
+
+        lecture_rows.append({
+            "timetable_id": entry["timetable_id"],
+            "day": entry["day_of_week"],
+            "time": f"{entry['start_time']}–{entry['end_time']}",
+            "start_time": entry["start_time"],
+            "end_time": entry["end_time"],
+            "room": entry["room"],
+            "class_id": entry["class_id"],
+            "class_code": entry["class_code"],
+            "department": entry["department"],
+            "semester": entry["semester"],
+            "section": entry["section"],
+            "subject_id": entry["subject_id"],
+            "subject_code": entry["subject_code"],
+            "subject_name": entry["subject_name"],
+            "assigned_lecturer": assigned_lecturer,
+            "live_session": live_session,
+            "status": status,
+        })
+
+    return lecture_rows
+
+
 @app.route("/")
 @role_required("hod")
 def index():
@@ -775,40 +939,23 @@ def index():
         datetime.strptime(selected_date, "%Y-%m-%d")
     except ValueError:
         selected_date = date.today().isoformat()
-    search = request.args.get("q", "").strip()
-    selected_branch = request.args.get("branch", "all").strip()
-    selected_subject = request.args.get("subject", "").strip()
-    record_branch = request.args.get("record_branch", "all").strip()
-    record_class_id = request.args.get("record_class_id", "").strip()
     with db() as conn:
-        departments = conn.execute("SELECT code,name FROM departments ORDER BY name COLLATE NOCASE").fetchall()
-        record_classes = conn.execute("SELECT id,class_code,department,semester,section FROM classes ORDER BY department,semester,section,class_code").fetchall()
-    valid_branch_codes = {row["code"].casefold() for row in departments}
-    if selected_branch.casefold() not in valid_branch_codes:
-        selected_branch = "all"
-    if record_branch.casefold() not in valid_branch_codes:
-        record_branch = "all"
-    if record_branch != "all":
-        record_classes = [item for item in record_classes if item["department"].casefold() == record_branch.casefold()]
-    if record_class_id not in {str(item["id"]) for item in record_classes}:
-        record_class_id = ""
-    data = dashboard_data(selected_date, search, branch=record_branch, class_id=record_class_id)
-    class_attendance = class_attendance_summaries(selected_date)
-    if selected_branch != "all":
-        selected_department = next(row for row in departments if row["code"].casefold() == selected_branch.casefold())
-        accepted_department_names = {selected_department["code"].casefold(), selected_department["name"].casefold()}
-        class_attendance = [item for item in class_attendance
-                            if (item.get("department") or "").strip().casefold() in accepted_department_names]
-    available_subjects = sorted({item["subject"] for item in class_attendance}, key=str.casefold)
-    if selected_subject not in available_subjects:
-        selected_subject = ""
-    if selected_subject:
-        class_attendance = [item for item in class_attendance if item["subject"] == selected_subject]
-    return render_template("dashboard.html", data=data, selected_date=selected_date, search=search,
-                           today=date.today().isoformat(), generated_at=datetime.now().strftime("%d %b %Y, %I:%M %p"),
-                           class_attendance=class_attendance, departments=departments, selected_branch=selected_branch,
-                           available_subjects=available_subjects, selected_subject=selected_subject,
-                           record_classes=record_classes, record_branch=record_branch, record_class_id=record_class_id,
+        departments = conn.execute("""SELECT d.id,d.code,d.name,
+            COUNT(c.id) AS class_count
+            FROM departments d LEFT JOIN classes c
+                ON upper(c.department)=upper(d.code) OR upper(c.department)=upper(d.name)
+            GROUP BY d.id,d.code,d.name
+            ORDER BY d.name COLLATE NOCASE""").fetchall()
+    data = dashboard_data(selected_date, "")
+    recent_sessions = class_attendance_summaries(selected_date)[:5]
+    import threading
+    scheduler_running = any(thread.name == "attendance-scheduler" and thread.is_alive()
+                            for thread in threading.enumerate())
+
+    return render_template("dashboard.html", data=data, selected_date=selected_date,
+                           departments=departments,
+                           recent_sessions=recent_sessions, scheduler_running=scheduler_running,
+                           class_count=sum(row["class_count"] for row in departments),
                            admin_user=session.get("username", "hod"), display_name=session.get("display_name", "HOD"))
 
 
@@ -864,6 +1011,31 @@ def department_management():
             (SELECT COUNT(*) FROM classes c WHERE upper(c.department)=upper(d.code) OR upper(c.department)=upper(d.name)) AS class_count
             FROM departments d ORDER BY d.name COLLATE NOCASE""").fetchall()
     return render_template("departments.html", departments=departments,
+                           admin_user=session.get("username", "hod"))
+
+
+@app.get("/departments/<int:department_id>")
+@role_required("hod")
+def department_dashboard(department_id):
+    with db() as conn:
+        department = conn.execute("SELECT * FROM departments WHERE id=?", (department_id,)).fetchone()
+        if not department:
+            flash("Department not found.", "error")
+            return redirect(url_for("index"))
+        classes = conn.execute("""SELECT c.*,
+            (SELECT COUNT(*) FROM class_students cs WHERE cs.class_id=c.id) AS student_count,
+            (SELECT COUNT(*) FROM subjects s WHERE s.class_id=c.id) AS subject_count,
+            (SELECT COUNT(*) FROM timetable_entries t WHERE t.class_id=c.id) AS timetable_count,
+            (SELECT COUNT(*) FROM attendance_sessions a WHERE a.class_id=c.id) AS session_count
+            FROM classes c
+            WHERE upper(c.department)=upper(?) OR upper(c.department)=upper(?)
+            ORDER BY c.semester,c.section,c.academic_year,c.class_code""",
+            (department["code"], department["name"])).fetchall()
+    department_schedule = [row for row in _build_lecture_rows(date.today().isoformat())
+                           if row["department"].strip().casefold() in
+                           {department["code"].strip().casefold(), department["name"].strip().casefold()}]
+    return render_template("department_dashboard.html", department=department, classes=classes,
+                           department_schedule=department_schedule,
                            admin_user=session.get("username", "hod"))
 
 
@@ -963,9 +1135,11 @@ def class_dashboard(class_id):
                                   (class_record["department"], class_record["department"])).fetchone()
         student_count = conn.execute("SELECT COUNT(*) FROM class_students WHERE class_id=?", (class_id,)).fetchone()[0]
         assigned_rolls = [r[0] for r in conn.execute("SELECT roll FROM class_students WHERE class_id=?", (class_id,))]
+    class_schedule = [row for row in _build_lecture_rows(date.today().isoformat())
+                      if row["class_id"] == class_id]
     return render_template("class_dashboard.html", class_record=class_record, department=department,
                            student_count=student_count, admin_user=session.get("username", "hod"),
-                           user_role=session.get("role", "hod"))
+                           user_role=session.get("role", "hod"), class_schedule=class_schedule)
 
 
 @app.route("/classes/<int:class_id>/students", methods=["GET", "POST"])
@@ -1499,17 +1673,43 @@ def parse_timetable_upload(file_storage):
 @app.route("/timetable", methods=["GET", "POST"])
 @role_required("hod")
 def timetable_page():
+    department_id_text = request.values.get("department_id", "").strip()
+    department = None
+    if department_id_text:
+        try:
+            department_id = int(department_id_text)
+        except ValueError:
+            flash("Invalid department.", "error")
+            return redirect(url_for("index"))
+        with db() as conn:
+            department = conn.execute("SELECT * FROM departments WHERE id=?", (department_id,)).fetchone()
+        if not department:
+            flash("Department not found.", "error")
+            return redirect(url_for("index"))
+
     if request.method == "POST":
+        if not department:
+            flash("Open a department workspace before importing a timetable.", "error")
+            return redirect(url_for("department_management"))
         upload = request.files.get("timetable_file")
         if not upload or not upload.filename:
             flash("Choose a CSV or XLSX timetable file.", "error")
         else:
             try:
                 rows = parse_timetable_upload(upload)
+                if department:
+                    with db() as conn:
+                        department_class_ids = {row[0] for row in conn.execute(
+                            "SELECT id FROM classes WHERE upper(department)=upper(?) OR upper(department)=upper(?)",
+                            (department["code"], department["name"])).fetchall()}
+                    if any(row["class_id"] not in department_class_ids for row in rows):
+                        raise ValueError(f"This timetable contains classes outside {department['name']}.")
                 now = datetime.now().isoformat(timespec="seconds")
                 with db() as conn:
-                    # A valid upload replaces the active timetable atomically.
-                    conn.execute("DELETE FROM timetable_entries")
+                    # A valid upload replaces only the selected department's timetable atomically.
+                    conn.execute("""DELETE FROM timetable_entries WHERE class_id IN
+                        (SELECT id FROM classes WHERE upper(department)=upper(?) OR upper(department)=upper(?))""",
+                                 (department["code"], department["name"]))
                     for row in rows:
                         subject = conn.execute("SELECT id FROM subjects WHERE class_id=? AND upper(code)=upper(?)",
                                                (row["class_id"], row["code"])).fetchone()
@@ -1521,130 +1721,24 @@ def timetable_page():
                                                       (row["class_id"], row["code"], row["name"], now)).lastrowid
                         conn.execute("INSERT INTO timetable_entries(class_id,subject_id,day_of_week,start_time,end_time,room,created_at) VALUES(?,?,?,?,?,?,?)",
                                      (row["class_id"], subject_id, row["day"], row["start"], row["end"], row["room"], now))
-                audit("timetable_imported", "timetable", "all", f"{len(rows)} entries")
+                audit("timetable_imported", "timetable", str(department["id"]), f"{len(rows)} entries")
                 flash(f"Imported {len(rows)} timetable entries. Automatic launch runs while app.py is running on the camera computer.", "success")
             except (ValueError, sqlite3.Error) as exc:
                 flash(f"Timetable import failed: {exc}", "error")
-        return redirect(url_for("timetable_page"))
+        return redirect(url_for("timetable_page", department_id=department["id"]))
     with db() as conn:
-        entries = conn.execute("""SELECT t.*,c.class_code,s.code AS subject_code,s.name AS subject_name
-            FROM timetable_entries t JOIN classes c ON c.id=t.class_id JOIN subjects s ON s.id=t.subject_id
-            ORDER BY CASE t.day_of_week WHEN 'Monday' THEN 1 WHEN 'Tuesday' THEN 2 WHEN 'Wednesday' THEN 3 WHEN 'Thursday' THEN 4 WHEN 'Friday' THEN 5 WHEN 'Saturday' THEN 6 ELSE 7 END,t.start_time,c.class_code""").fetchall()
-    return render_template("timetable.html", entries=entries, admin_user=session.get("username", "hod"))
-
-
-@app.get("/lectures")
-@role_required("hod")
-def lectures_page():
-    """HOD view: consolidated timetable with assigned lecturers and live session status."""
-    selected_date = request.args.get("date", date.today().isoformat())
-    try:
-        datetime.strptime(selected_date, "%Y-%m-%d")
-    except ValueError:
-        selected_date = date.today().isoformat()
-    day_name = datetime.strptime(selected_date, "%Y-%m-%d").strftime("%A")
-
-    with db() as conn:
-        # Get all timetable entries for this day with class, subject, and assigned lecturer info
-        entries = conn.execute("""
-            SELECT
-                t.id AS timetable_id,
-                t.day_of_week,
-                t.start_time,
-                t.end_time,
-                t.room,
-                c.id AS class_id,
-                c.class_code,
-                c.department,
-                c.semester,
-                c.section,
-                s.id AS subject_id,
-                s.code AS subject_code,
-                s.name AS subject_name,
-                u.id AS lecturer_id,
-                u.display_name AS lecturer_name,
-                u.username AS lecturer_username
-            FROM timetable_entries t
-            JOIN classes c ON c.id = t.class_id
-            JOIN subjects s ON s.id = t.subject_id
-            LEFT JOIN lecturer_assignments la ON la.class_id = c.id AND la.subject_id = s.id
-            LEFT JOIN users u ON u.id = la.user_id AND u.role = 'lecturer'
-            WHERE t.day_of_week = ? AND t.is_active = 1
-            ORDER BY t.start_time, c.class_code
-        """, (day_name,)).fetchall()
-
-        # Get live sessions for today
-        live_sessions = conn.execute("""
-            SELECT a.id, a.class_id, a.subject_id, a.session_date, a.start_time, a.end_time, a.status,
-                   a.started_at, a.started_by_user_id,
-                   u.display_name AS started_by_name,
-                   c.class_code, s.code AS subject_code, s.name AS subject_name
-            FROM attendance_sessions a
-            JOIN classes c ON c.id = a.class_id
-            JOIN subjects s ON s.id = a.subject_id
-            LEFT JOIN users u ON u.id = a.started_by_user_id
-            WHERE a.session_date = ? AND a.status IN ('running', 'scheduled')
-        """, (selected_date,)).fetchall()
-
-    # Build a lookup for live sessions
-    live_by_key = {}
-    for sess in live_sessions:
-        key = (sess["class_id"], sess["subject_id"])
-        live_by_key[key] = sess
-
-    # Build a lookup for assigned lecturers from assignments table
-    lecturer_by_key = {}
-    for entry in entries:
-        key = (entry["class_id"], entry["subject_id"])
-        if entry["lecturer_id"]:
-            lecturer_by_key[key] = {
-                "id": entry["lecturer_id"],
-                "name": entry["lecturer_name"],
-                "username": entry["lecturer_username"]
-            }
-
-    # Merge data for template
-    lecture_rows = []
-    for entry in entries:
-        key = (entry["class_id"], entry["subject_id"])
-        assigned_lecturer = lecturer_by_key.get(key)
-        live_session = live_by_key.get(key)
-
-        # Determine status
-        status = "scheduled"
-        if live_session:
-            status = live_session["status"]  # 'running' or 'scheduled'
-        elif assigned_lecturer:
-            status = "assigned"
+        if department:
+            entries = conn.execute("""SELECT t.*,c.class_code,s.code AS subject_code,s.name AS subject_name
+                FROM timetable_entries t JOIN classes c ON c.id=t.class_id JOIN subjects s ON s.id=t.subject_id
+                WHERE upper(c.department)=upper(?) OR upper(c.department)=upper(?)
+                ORDER BY CASE t.day_of_week WHEN 'Monday' THEN 1 WHEN 'Tuesday' THEN 2 WHEN 'Wednesday' THEN 3 WHEN 'Thursday' THEN 4 WHEN 'Friday' THEN 5 WHEN 'Saturday' THEN 6 ELSE 7 END,t.start_time,c.class_code""",
+                (department["code"], department["name"])).fetchall()
         else:
-            status = "unassigned"
-
-        lecture_rows.append({
-            "timetable_id": entry["timetable_id"],
-            "day": entry["day_of_week"],
-            "time": f"{entry['start_time']}–{entry['end_time']}",
-            "start_time": entry["start_time"],
-            "end_time": entry["end_time"],
-            "room": entry["room"],
-            "class_id": entry["class_id"],
-            "class_code": entry["class_code"],
-            "department": entry["department"],
-            "semester": entry["semester"],
-            "section": entry["section"],
-            "subject_id": entry["subject_id"],
-            "subject_code": entry["subject_code"],
-            "subject_name": entry["subject_name"],
-            "assigned_lecturer": assigned_lecturer,
-            "live_session": live_session,
-            "status": status,
-        })
-
-    return render_template("lectures.html",
-                           lecture_rows=lecture_rows,
-                           selected_date=selected_date,
-                           today=date.today().isoformat(),
-                           admin_user=session.get("username", "hod"),
-                           display_name=session.get("display_name", "HOD"))
+            entries = conn.execute("""SELECT t.*,c.class_code,s.code AS subject_code,s.name AS subject_name
+                FROM timetable_entries t JOIN classes c ON c.id=t.class_id JOIN subjects s ON s.id=t.subject_id
+                ORDER BY CASE t.day_of_week WHEN 'Monday' THEN 1 WHEN 'Tuesday' THEN 2 WHEN 'Wednesday' THEN 3 WHEN 'Thursday' THEN 4 WHEN 'Friday' THEN 5 WHEN 'Saturday' THEN 6 ELSE 7 END,t.start_time,c.class_code""").fetchall()
+    return render_template("timetable.html", entries=entries, department=department,
+                           admin_user=session.get("username", "hod"))
 
 
 @app.get("/classes/<int:class_id>/timetable")
@@ -1875,16 +1969,15 @@ def export_class_session_csv(class_id, session_id):
 def recover_stale_sessions(now):
     """Fail sessions that have been 'running' far past their scheduled window.
 
-    psutil.Process(pid).is_running() only proves the process exists; it cannot
-    tell a healthy camera process from one that is hung on a frozen camera or
-    an endless liveness challenge. Any session whose start time predates the end
-    of its scheduled window plus the grace period plus a buffer is considered
-    unrecoverable and reset so the scheduler can relaunch it.
+    Checks both process liveness and heartbeat to detect hung processes.
+    Any session whose start time predates the end of its scheduled window
+    plus the grace period plus a buffer is considered unrecoverable and
+    reset so the scheduler can relaunch it.
     """
     try:
         with db() as conn:
-            rows = conn.execute("""SELECT id, started_at, session_date, end_time FROM attendance_sessions
-                WHERE status='running' AND started_at IS NOT NULL""").fetchall()
+            rows = conn.execute("""SELECT id, started_at, heartbeat_at, session_date, end_time, process_id
+                FROM attendance_sessions WHERE status='running' AND started_at IS NOT NULL""").fetchall()
         for row in rows:
             try:
                 started = datetime.fromisoformat(row["started_at"])
@@ -1897,11 +1990,49 @@ def recover_stale_sessions(now):
             deadline = end_dt + timedelta(minutes=GRACE_MINUTES + STALE_SESSION_BUFFER_MINUTES)
             if now <= deadline:
                 continue
+
+            # Check process and heartbeat
+            process_alive = False
+            if row["process_id"]:
+                try:
+                    process_alive = psutil.Process(int(row["process_id"])).is_running()
+                except (psutil.NoSuchProcess, psutil.AccessDenied, ValueError, TypeError):
+                    process_alive = False
+
+            heartbeat_recent = False
+            if row["heartbeat_at"]:
+                try:
+                    hb = datetime.fromisoformat(row["heartbeat_at"])
+                    heartbeat_recent = (now - hb).total_seconds() < 30
+                except (ValueError, TypeError):
+                    pass
+
+            if process_alive and heartbeat_recent:
+                continue
+
             with db() as conn:
                 conn.execute("UPDATE attendance_sessions SET status='failed', process_id=NULL WHERE id=?",
                              (row["id"],))
             audit("attendance_session_stale", "session", row["id"],
-                  f"running since {row['started_at']} past deadline {deadline.isoformat(timespec='seconds')}")
+                  f"running since {row['started_at']} past deadline {deadline.isoformat(timespec='seconds')}; process_alive={process_alive}, heartbeat_recent={heartbeat_recent}")
+            notify_lecturers_of_stale_session(row["id"])
+    except sqlite3.Error:
+        pass
+
+
+def notify_lecturers_of_stale_session(session_id):
+    """Log notification for stale session recovery."""
+    try:
+        with db() as conn:
+            session_row = conn.execute("""SELECT a.*, c.class_code, s.name AS subject_name,
+                u.display_name FROM attendance_sessions a
+                JOIN classes c ON c.id=a.class_id
+                JOIN subjects s ON s.id=a.subject_id
+                LEFT JOIN users u ON u.id=a.started_by_user_id
+                WHERE a.id=?""", (session_id,)).fetchone()
+            if session_row:
+                audit("stale_session_notification", "session", session_id,
+                      f"Auto-recovered stale session for {session_row['class_code']} / {session_row['subject_name']} (was started by {session_row['display_name'] or 'unknown'})")
     except sqlite3.Error:
         pass
 
@@ -1966,7 +2097,78 @@ def scheduler_loop():
 
 @app.get("/health")
 def health():
-    return jsonify({"status": "ok"})
+    """Comprehensive system health check for monitoring and debugging."""
+    from constants import SCHEDULER_INTERVAL_SECONDS
+    import threading
+    from camera_utils import quick_camera_check
+
+    checks = {}
+    overall = "healthy"
+
+    # 1. Database connectivity
+    try:
+        with db() as conn:
+            conn.execute("SELECT 1")
+        checks["database"] = {"status": "ok", "message": "Connected"}
+    except Exception as e:
+        checks["database"] = {"status": "error", "message": str(e)}
+        overall = "degraded"
+
+    # 2. ONNX model files
+    models_dir = BASE_DIR / "models"
+    required_models = [
+        "face_detection_yunet_2023mar.onnx",
+        "face_recognition_sface_2021dec.onnx",
+    ]
+    missing = [m for m in required_models if not (models_dir / m).exists()]
+    if missing:
+        checks["models"] = {"status": "error", "message": f"Missing: {', '.join(missing)}"}
+        overall = "degraded"
+    else:
+        checks["models"] = {"status": "ok", "message": "All ONNX models present"}
+
+    # 3. Face Landmarker model
+    landmarker_path = models_dir / "face_landmarker.task"
+    if landmarker_path.exists():
+        checks["landmarker"] = {"status": "ok", "message": "Face landmarker model present"}
+    else:
+        checks["landmarker"] = {"status": "error", "message": "face_landmarker.task missing"}
+        overall = "degraded"
+
+    # 4. Camera availability
+    try:
+        import cv2
+        camera_ok, camera_msg = quick_camera_check(cv2)
+        checks["camera"] = {"status": "ok" if camera_ok else "error", "message": camera_msg}
+        if not camera_ok:
+            overall = "degraded"
+    except Exception as e:
+        checks["camera"] = {"status": "error", "message": f"Check failed: {e}"}
+        overall = "degraded"
+
+    # 5. Scheduler thread status
+    scheduler_thread = next((t for t in threading.enumerate() if t.name == "attendance-scheduler"), None)
+    if scheduler_thread and scheduler_thread.is_alive():
+        checks["scheduler"] = {"status": "ok", "message": "Scheduler thread running"}
+    else:
+        checks["scheduler"] = {"status": "error", "message": "Scheduler thread not found"}
+        overall = "degraded"
+
+    # 6. Active sessions count
+    try:
+        with db() as conn:
+            running = conn.execute("SELECT COUNT(*) FROM attendance_sessions WHERE status='running'").fetchone()[0]
+            scheduled = conn.execute("SELECT COUNT(*) FROM attendance_sessions WHERE status='scheduled' AND session_date=?", (date.today().isoformat(),)).fetchone()[0]
+        checks["sessions"] = {"status": "ok", "message": f"Running: {running}, Scheduled today: {scheduled}"}
+    except Exception as e:
+        checks["sessions"] = {"status": "error", "message": str(e)}
+        overall = "degraded"
+
+    return jsonify({
+        "status": overall,
+        "timestamp": datetime.now().isoformat(timespec="seconds"),
+        "checks": checks
+    })
 
 
 init_db()

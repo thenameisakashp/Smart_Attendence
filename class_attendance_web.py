@@ -47,11 +47,15 @@ def connect():
         conn.close()
 
 
-def finish_session(session_id: int, status: str = "completed") -> None:
+def finish_session(session_id: int, status: str = "completed", lock: bool = False) -> None:
     now = datetime.now().isoformat(timespec="seconds")
     with connect() as conn:
-        conn.execute("UPDATE attendance_sessions SET status=?, completed_at=?, process_id=NULL WHERE id=? AND status!='completed'",
-                     (status, now, session_id))
+        if lock:
+            conn.execute("UPDATE attendance_sessions SET status=?, completed_at=?, process_id=NULL, locked=1 WHERE id=? AND status!='completed'",
+                         (status, now, session_id))
+        else:
+            conn.execute("UPDATE attendance_sessions SET status=?, completed_at=?, process_id=NULL WHERE id=? AND status!='completed'",
+                         (status, now, session_id))
 
 
 def main(session_id: int, class_id: int) -> int:
@@ -119,12 +123,23 @@ def main(session_id: int, class_id: int) -> int:
     seen_this_run = set()
     liveness_checks = {}
     status_message = "Attendance running"
+    last_heartbeat = time.time()
     try:
         while datetime.now() <= hard_deadline:
             ok, frame = cap.read()
             if not ok:
                 time.sleep(0.05)
                 continue
+
+            # Send heartbeat every 10 seconds
+            if time.time() - last_heartbeat >= 10:
+                try:
+                    with connect() as conn:
+                        conn.execute("UPDATE attendance_sessions SET heartbeat_at=? WHERE id=?",
+                                     (datetime.now().isoformat(timespec="seconds"), session_id))
+                except Exception:
+                    pass  # heartbeat failures should not crash the loop
+                last_heartbeat = time.time()
             height, width = frame.shape[:2]
             detector.setInputSize((width, height))
             _, faces = detector.detect(frame)
@@ -186,7 +201,8 @@ def main(session_id: int, class_id: int) -> int:
     finally:
         cap.release()
         cv2.destroyAllWindows()
-        finish_session(session_id)
+        # Lock session on normal completion (Q/ESC or timeout)
+        finish_session(session_id, lock=True)
     print(f"Session #{session_id} completed. Newly marked this run: {len(seen_this_run)}")
     return 0
 

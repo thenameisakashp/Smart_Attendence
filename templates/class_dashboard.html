@@ -20,7 +20,7 @@
                         <a href="{{ url_for('class_students',class_id=class_record.id) }}">♙ Students</a>
                         <a href="{{ url_for('class_timetable',class_id=class_record.id) }}">◷ Timetable</a>
                         <a href="{{ url_for('class_attendance_page',class_id=class_record.id) }}">✓ Attendance & reports</a>
-                        <a href="{{ url_for('lectures_page') }}">◷ Lectures Today</a>
+                        
                         <a href="{{ url_for('department_management') if user_role=='hod' else url_for('lecturer_dashboard') }}">← Back</a>
                     </nav>
                     <div class="side-bottom">
@@ -99,6 +99,14 @@
                             </a>
                         {% endif %}
                     </section>
+                    {% if class_schedule %}
+                    <section class="panel compact-panel">
+                        <div class="panel-head"><div><h3>Today’s class schedule</h3><p>Timetable entries for {{ class_record.class_code }} today.</p></div><span class="pill">{{ class_schedule|length }} classes</span></div>
+                        <div class="table-wrap"><table><thead><tr><th>TIME</th><th>SUBJECT</th><th>ROOM</th><th>STATUS</th></tr></thead><tbody>
+                            {% for row in class_schedule %}<tr><td>{{ row.time }}</td><td>{{ row.subject_code }} — {{ row.subject_name }}</td><td>{{ row.room or '—' }}</td><td><span class="status-pill {{ row.status|lower }}">{{ row.status|title }}</span></td></tr>{% endfor %}
+                        </tbody></table></div>
+                    </section>
+                    {% endif %}
 
                     <div	class="notice">
                         <b>Camera requirement:</b> Recognition runs on the computer hosting this application. Ensure the YuNet and SFace model files exist in <code>models/</code>, and keep this Flask process running for automatic timetable launches.

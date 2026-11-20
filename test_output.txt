@@ -1,0 +1,4 @@
+Smart Attendance Dashboard: http://127.0.0.1:5000
+[scheduler] Timetable scheduler active; automatic attendance starts when a scheduled slot is reached (30-minute catch-up window).
+ * Serving Flask app 'app'
+ * Debug mode: off
